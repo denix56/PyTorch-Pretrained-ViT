@@ -24,6 +24,47 @@ def merge_last(x, n_dims):
     return x.view(*s[:-n_dims], -1)
 
 
+class SLN(nn.Module):
+    """
+    Self-modulated LayerNorm
+    """
+    def __init__(self, num_features):
+        super(SLN, self).__init__()
+        self.ln = nn.LayerNorm(num_features)
+        # self.gamma = nn.Parameter(torch.FloatTensor(1, 1, 1))
+        # self.beta = nn.Parameter(torch.FloatTensor(1, 1, 1))
+        self.gamma = nn.Parameter(torch.randn(1, 1, 1)) #.to("cuda")
+        self.beta = nn.Parameter(torch.randn(1, 1, 1)) #.to("cuda")
+
+    def forward(self, hl, w):
+        return self.gamma * w * self.ln(hl) + self.beta * w
+
+
+class SineLayer(nn.Module):
+    """
+    Paper: Implicit Neural Representation with Periodic Activation Function (SIREN)
+    """
+    def __init__(self, in_features, out_features, bias = True,is_first = False, omega_0 = 30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, np.sqrt(6 / self.in_features) / self.omega_0)
+
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+
+
 class MultiHeadedSelfAttention(nn.Module):
     """Multi-Headed Dot Product Attention"""
     def __init__(self, dim, num_heads, dropout):
@@ -100,3 +141,9 @@ class Transformer(nn.Module):
         for block in self.blocks:
             x = block(x, mask)
         return x
+
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        

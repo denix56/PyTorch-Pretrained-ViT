@@ -3,6 +3,7 @@
 """
 
 from typing import Optional
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -19,9 +20,30 @@ class PositionalEmbedding1D(nn.Module):
         super().__init__()
         self.pos_embedding = nn.Parameter(torch.zeros(1, seq_len, dim))
     
-    def forward(self, x):
+    def forward(self, x, mask = None):
         """Input has shape `(batch_size, seq_len, emb_dim)`"""
-        return x + self.pos_embedding
+        if mask is None:
+            return x + self.pos_embedding
+        else:
+            return x + self.pos_embedding.expand(x.shape[0], -1, -1)[mask].view(*x.shape)
+
+
+class MaskTransLayerNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-12):
+        """Construct the normalization for each patch
+        """
+        super(MaskTransLayerNorm, self).__init__()
+
+        self.gamma = nn.Parameter(torch.ones(hidden_size))
+        self.beta = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, x):
+        u = x[:, :].mean(-1, keepdim=True)
+        s = (x[:, :] - u).pow(2).mean(-1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+        return self.gamma * x + self.beta
+
 
 
 class ViT(nn.Module):
@@ -51,17 +73,19 @@ class ViT(nn.Module):
         load_repr_layer: bool = False,
         classifier: str = 'token',
         positional_embedding: str = '1d',
-        in_channels: int = 3, 
+        in_channels: int = 3,
+        distilled: bool = False,
+        use_mask_token: bool = False,
         image_size: Optional[int] = None,
         num_classes: Optional[int] = None,
     ):
         super().__init__()
 
         # Configuration
-        if name is None:
+        if name is None or not pretrained:
             check_msg = 'must specify name of pretrained model'
             assert not pretrained, check_msg
-            assert not resize_positional_embedding, check_msg
+            # assert not resize_positional_embedding, check_msg
             if num_classes is None:
                 num_classes = 1000
             if image_size is None:
@@ -90,21 +114,39 @@ class ViT(nn.Module):
         fh, fw = as_tuple(patches)  # patch sizes
         gh, gw = h // fh, w // fw  # number of patches
         seq_len = gh * gw
+        self.gh = gh
+        self.gw = gw
+        self.distilled = distilled
+        self.use_mask_token = use_mask_token
 
         # Patch embedding
         self.patch_embedding = nn.Conv2d(in_channels, dim, kernel_size=(fh, fw), stride=(fh, fw))
 
         # Class token
         if classifier == 'token':
-            self.class_token = nn.Parameter(torch.zeros(1, 1, dim))
+            self.has_cls_token = True
+            if not self.use_mask_token:
+                self.class_token = nn.Parameter(torch.zeros(1, 1, dim))
             seq_len += 1
+        else:
+            self.has_cls_token = False
+
+        if distilled:
+            if not self.use_mask_token:
+                self.dist_token = nn.Parameter(torch.zeros(1, 1, dim))
+            seq_len += 1
+
+        if use_mask_token:
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
+            self.patch_norm = MaskTransLayerNorm(dim)
+            self.unconv = nn.ConvTranspose2d(dim, in_channels, kernel_size=(fh, fw), stride=(fh, fw))
         
         # Positional embedding
         if positional_embedding.lower() == '1d':
             self.positional_embedding = PositionalEmbedding1D(seq_len, dim)
         else:
             raise NotImplementedError()
-        
+
         # Transformer
         self.transformer = Transformer(num_layers=num_layers, dim=dim, num_heads=num_heads, 
                                        ff_dim=ff_dim, dropout=dropout_rate)
@@ -147,27 +189,75 @@ class ViT(nn.Module):
         nn.init.constant_(self.fc.weight, 0)
         nn.init.constant_(self.fc.bias, 0)
         nn.init.normal_(self.positional_embedding.pos_embedding, std=0.02)  # _trunc_normal(self.positional_embedding.pos_embedding, std=0.02)
-        nn.init.constant_(self.class_token, 0)
+        if hasattr(self, 'class_token'):
+            nn.init.constant_(self.class_token, 0)
+        if hasattr(self, 'dist_token'):
+            nn.init.constant_(self.dist_token, 0)
+        if hasattr(self, 'mask_token'):
+            nn.init.constant_(self.mask_token, 0)
 
-    def forward(self, x):
+
+    def forward(self, x, mask_rate:float = 0.0, enc_mask=None):
         """Breaks image into patches, applies transformer, applies MLP head.
 
         Args:
             x (tensor): `b,c,fh,fw`
         """
-        b, c, fh, fw = x.shape
-        x = self.patch_embedding(x)  # b,d,gh,gw
-        x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
-        if hasattr(self, 'class_token'):
-            x = torch.cat((self.class_token.expand(b, -1, -1), x), dim=1)  # b,gh*gw+1,d
-        if hasattr(self, 'positional_embedding'): 
-            x = self.positional_embedding(x)  # b,gh*gw+1,d 
-        x = self.transformer(x)  # b,gh*gw+1,d
-        if hasattr(self, 'pre_logits'):
-            x = self.pre_logits(x)
-            x = torch.tanh(x)
-        if hasattr(self, 'fc'):
-            x = self.norm(x)[:, 0]  # b,d
-            x = self.fc(x)  # b,num_classes
-        return x
+        mask = None
+        if not self.use_mask_token:
+            b, c, fh, fw = x.shape
+            x = self.patch_embedding(x)  # b,d,gh,gw
+            x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
+            if mask_rate > 0.0:
+                rng = np.random.default_rng()
+                mask_indices = torch.multinomial(torch.full((1, x.shape[1]), 1/x.shape[1], device=x.device).expand(b, -1),
+                                                 int((1-mask_rate)*x.shape[1]))
+                mask = torch.zeros(*x.shape[:2], dtype=bool, device=x.device)
+                mask.scatter_(1, mask_indices, 1)
+                x = x[mask].view(b, -1, x.shape[2])
+
+            add_patches = 0
+            if hasattr(self, 'class_token'):
+                add_patches += 1
+                if not self.distilled:
+                    x = torch.cat((self.class_token.expand(b, -1, -1), x), dim=1)  # b,gh*gw+1,d
+                else:
+                    add_patches += 1
+                    x = torch.cat((self.class_token.expand(b, -1, -1), self.dist_token.expand(b, -1, -1), x),
+                                  dim=1)  # b,gh*gw+2,d
+            if mask is not None and add_patches > 0:
+                mask = torch.cat((torch.ones(b, add_patches, dtype=bool, device=mask.device), mask), dim=1)
+        else:
+            assert enc_mask is not None
+            aux_patches = 0
+            if self.has_cls_token:
+                aux_patches += 1
+            if self.distilled:
+                aux_patches += 1
+
+            x_new = self.mask_token.repeat(x.shape[0], self.gh*self.gw + aux_patches, 1)
+            x_new[enc_mask] = x.flatten(0, 1)
+            x = x_new
+
+        if hasattr(self, 'positional_embedding'):
+            x = self.positional_embedding(x, mask)  # b,gh*gw+1(2),d
+        x = self.transformer(x)  # b,gh*gw+1(2),d
+
+        if self.use_mask_token:
+            x = self.patch_norm(x[:, aux_patches:])
+            x = x.view(-1, self.gh, self.gw, x.shape[-1]).permute(0, 3, 1, 2)
+            x = self.unconv(x)
+
+        if mask is None and enc_mask is None:
+            if hasattr(self, 'pre_logits'):
+                x = self.pre_logits(x)
+                x = torch.tanh(x)
+            if hasattr(self, 'fc'):
+                x = self.norm(x)[:, 0]  # b,d
+                x = self.fc(x)  # b,num_classes
+        elif enc_mask is None:
+            x = self.norm(x)
+        return x, mask
+
+
 
