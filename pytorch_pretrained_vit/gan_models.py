@@ -1,5 +1,6 @@
 import numpy as np
 from einops import rearrange, repeat
+import opt_einsum as oe
 
 import torch
 import torch.nn as nn
@@ -87,10 +88,10 @@ class Attention(nn.Module):
         if self.discriminator:
             attn = torch.cdist(q, k, p = 2)
         else:
-            attn = torch.einsum("... i d, ... j d -> ... i j", q, k)
+            attn = oe.contract("... i d, ... j d -> ... i j", q, k)
         scale_attn = attn * self.scale_factor
         scale_attn_score = torch.softmax(scale_attn, dim = -1)
-        result = torch.einsum("... i j, ... j d -> ... i d", scale_attn_score, v)
+        result = oe.contract("... i j, ... j d -> ... i d", scale_attn_score, v)
 
         # re-compose
         result = rearrange(result, "b h t d -> b t (h d)")
