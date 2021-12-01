@@ -67,14 +67,14 @@ class Attention(nn.Module):
         self.w_out = nn.Linear(self.weight_dim, dim, bias = True)
 
         if discriminator:
-            u, s, v = torch.svd(self.to_qkv.weight)
+            s = torch.linalg.svdvals(self.to_qkv.weight)
             self.init_spect_norm = torch.max(s)
 
     def forward(self, x):
         assert x.dim() == 3
 
         if self.discriminator:
-            u, s, v = torch.svd(self.to_qkv.weight)
+            s = torch.linalg.svdvals(self.to_qkv.weight)
             self.to_qkv.weight = torch.nn.Parameter(self.to_qkv.weight * self.init_spect_norm / torch.max(s))
 
         # Generate the q, k, v vectors
