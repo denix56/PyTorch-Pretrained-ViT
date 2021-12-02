@@ -194,11 +194,12 @@ class GTransformerEncoder(nn.Module):
         blocks = 6,
         num_heads = 8,
         dim_head = None,
-        dropout = 0
+        dropout = 0,
+        mode='none'
     ):
         layers = []
         for _ in range(blocks):
-            layers.append(GEncoderBlock(dim, num_heads, dim_head, dropout))
+            layers.append(GEncoderBlock(dim, num_heads, dim_head, dropout, mode=mode))
         return nn.ModuleList(layers)
 
     def forward(self, x, mem=None):
