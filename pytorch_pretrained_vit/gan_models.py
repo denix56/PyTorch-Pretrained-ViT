@@ -290,6 +290,7 @@ class Generator(nn.Module):
         dim_head = None,
         dropout = 0,
         out_channels = 3,
+        mode = 'none'
     ):
         super(Generator, self).__init__()
         h, w = as_tuple(image_size)  # image sizes
@@ -312,7 +313,7 @@ class Generator(nn.Module):
         #self.pos_emb1D = nn.Parameter(torch.randn(self.initialize_size * 8, dim))
         self.pos_emb1D = PositionalEmbedding1D(seq_len, dim)
         #self.mlp = nn.Linear(1024, (self.initialize_size * 8) * self.dim)
-        self.Transformer_Encoder = GTransformerEncoder(dim, blocks, num_heads, dim_head, dropout)
+        self.Transformer_Encoder = GTransformerEncoder(dim, blocks, num_heads, dim_head, dropout, mode=mode)
 
         # Implicit Neural Representation
         # self.w_out = nn.Sequential(
