@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 from itertools import chain
 import os
+import shutil
 
 from pytorch_pretrained_vit.gan_models import Generator, Discriminator
 
@@ -124,11 +125,11 @@ def train_mae(loader, loader_test, device):
                 }, 'mae.pth')
 
 
-def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=False):
-    generator_ab = Generator(image_size=224, blocks=3, mode=mode, use_siren=use_siren).to(device)
-    discriminator_ab = Discriminator(image_size=224, blocks=3).to(device)
-    generator_ba = Generator(image_size=224, blocks=3, mode=mode, use_siren=use_siren).to(device)
-    discriminator_ba = Discriminator(image_size=224, blocks=3).to(device)
+def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6, mode='none', use_siren=False):
+    generator_ab = Generator(image_size=224, blocks=blocks, mode=mode, use_siren=use_siren).to(device)
+    discriminator_ab = Discriminator(image_size=224, blocks=blocks).to(device)
+    generator_ba = Generator(image_size=224, blocks=blocks, mode=mode, use_siren=use_siren).to(device)
+    discriminator_ba = Discriminator(image_size=224, blocks=blocks).to(device)
 
     opt_g_ab = torch.optim.Adam(generator_ab.parameters(), lr=1e-4)
     opt_d_ab = torch.optim.Adam(discriminator_ab.parameters(), lr=1e-4)
@@ -140,6 +141,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='no
     n_epochs = 10000
     img_out_dir = '/home/dsenkin/Desktop/scratch/images_' + mode + ('_siren' if use_siren else '')
 
+    shutil.rmtree(img_out_dir, ignore_errors=True)
     os.makedirs(img_out_dir, exist_ok=True)
 
     for epoch in trange(n_epochs):
