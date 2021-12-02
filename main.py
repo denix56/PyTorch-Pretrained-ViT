@@ -8,7 +8,9 @@ from torchvision.utils import save_image
 from torchvision import models
 from tqdm import trange, tqdm
 from torch import nn
+import torch.nn.functional as F
 from itertools import chain
+import os
 
 from pytorch_pretrained_vit.gan_models import Generator, Discriminator
 
@@ -122,84 +124,141 @@ def train_mae(loader, loader_test, device):
                 }, 'mae.pth')
 
 
-def train_gan(loader, loader_test, device):
-    generator = Generator(2).to(device)
-    discriminator = Discriminator().to(device)
+def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
+    generator_ab = Generator(image_size=224, blocks=3).to(device)
+    discriminator_ab = Discriminator(image_size=224, blocks=3).to(device)
+    generator_ba = Generator(image_size=224, blocks=3).to(device)
+    discriminator_ba = Discriminator(image_size=224, blocks=3).to(device)
 
-    opt_g = torch.optim.Adam(generator.parameters(), betas=(0.0, 0.99), lr=1e-4)
-    opt_d = torch.optim.Adam(discriminator.parameters(), betas=(0.0, 0.99), lr=1e-4)
+    opt_g_ab = torch.optim.Adam(generator_ab.parameters(), betas=(0.0, 0.99), lr=1e-4)
+    opt_d_ab = torch.optim.Adam(discriminator_ab.parameters(), betas=(0.0, 0.99), lr=1e-4)
+    opt_g_ba = torch.optim.Adam(generator_ba.parameters(), betas=(0.0, 0.99), lr=1e-4)
+    opt_d_ba = torch.optim.Adam(discriminator_ba.parameters(), betas=(0.0, 0.99), lr=1e-4)
     criterion_mse = nn.MSELoss()
+    criterion_mae = nn.L1Loss()
     #criterion_ns = lambda d_score: -torch.mean(torch.log(torch.sigmoid(d_score) + 1e-8))
 
     n_epochs = 1000
-    latent_dim = 1024
+
+    os.makedirs('images', exist_ok=True)
 
     for epoch in trange(n_epochs):
-        loss_g_train = 0
-        loss_d_train = 0
+        loss_g_ab_train = 0
+        loss_d_ab_train = 0
 
-        generator.train()
-        discriminator.train()
+        loss_g_ba_train = 0
+        loss_d_ba_train = 0
 
-        for batch_i, (X, y) in tqdm(enumerate(loader), total=len(loader)):
-            X = X.to(device)
-            y = y.to(device)
+        generator_ab.train()
+        discriminator_ab.train()
+        generator_ba.train()
+        discriminator_ba.train()
 
-            valid = torch.ones(X.shape[0], 1, device=device)
-            fake = torch.zeros(X.shape[0], 1, device=device)
+        lmbda = 10
 
-            opt_d.zero_grad()
-            z = torch.randn(X.shape[0], latent_dim, device=device)
-            x_gen, _ = generator(z)
-            d_score_valid = discriminator(X)
-            d_score_fake = discriminator(x_gen)
-            d_loss = 0.5*(criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
-            d_loss.backward()
-            opt_d.step()
+        for batch_i, ((X_a, _), (X_b, _)) in tqdm(enumerate(zip(loader_a, loader_b)), total=min(len(loader_a), len(loader_b))):
+            X_a = X_a.to(device)
+            X_b = X_b.to(device)
 
-            loss_d_train += d_loss.item()
+            batch_size = min(X_a.shape[0], X_b.shape[0])
+            X_a = X_a[:batch_size]
+            X_b = X_b[:batch_size]
 
-            opt_g.zero_grad()
-            z = torch.randn(X.shape[0], latent_dim, device=device)
-            x_gen, _ = generator(z)
-            d_score_fake = discriminator(x_gen)
-            g_loss = criterion_mse(d_score_fake, valid)
+            valid = torch.ones(batch_size, 1, device=device)
+            fake = torch.zeros(batch_size, 1, device=device)
+
+            opt_d_ab.zero_grad()
+            x_b_gen = generator_ab(X_a)
+            d_score_valid = discriminator_ab(X_b)
+            d_score_fake = discriminator_ab(x_b_gen)
+            d_ab_loss = 0.5*(criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
+            d_ab_loss.backward()
+            opt_d_ab.step()
+            loss_d_ab_train += d_ab_loss.item()
+
+            opt_d_ba.zero_grad()
+            x_a_gen = generator_ba(X_b)
+            d_score_valid = discriminator_ba(X_a)
+            d_score_fake = discriminator_ba(x_a_gen)
+            d_ba_loss = 0.5 * (criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
+            d_ba_loss.backward()
+            opt_d_ba.step()
+            loss_d_ba_train += d_ba_loss.item()
+
+
+            opt_g_ab.zero_grad()
+            opt_g_ba.zero_grad()
+
+            x_b_gen = generator_ab(X_a)
+            d_ab_score_fake = discriminator_ab(x_b_gen)
+
+            x_a_gen = generator_ba(X_b)
+            d_ba_score_fake = discriminator_ba(x_a_gen)
+
+            x_a_cyc = generator_ba(x_b_gen)
+            x_b_cyc = generator_ab(x_a_gen)
+
+            g_ab_loss = criterion_mse(d_ab_score_fake, valid) + lmbda*criterion_mae(x_a_cyc, X_a)
+            g_ba_loss =  + criterion_mse(d_ba_score_fake, valid) + lmbda*criterion_mae(x_b_cyc, X_b)
+            g_loss = g_ab_loss + g_ba_loss
             g_loss.backward()
-            opt_g.step()
-
-            loss_g_train += g_loss.item()
+            opt_g_ba.step()
+            opt_g_ab.step()
+            loss_g_ab_train += g_ab_loss.item()
+            loss_g_ba_train += g_ba_loss.item()
 
         if epoch % 1 == 0:
             with torch.no_grad():
-                generator.eval()
-                discriminator.eval()
+                generator_ab.eval()
+                discriminator_ab.eval()
+                generator_ba.eval()
+                discriminator_ba.eval()
 
-                z = torch.randn(16, latent_dim, device=device)
+                X_a, _ = next(iter(loader_a_test))
+                X_b, _ = next(iter(loader_b_test))
 
-                x_gen, imgs = generator(z, ret_all_imgs=True)
+                X_a = X_a.to(device)
+                X_b = X_b.to(device)
+
+                x_b_gen = generator_ab(X_a)
+                x_a_gen = generator_ba(X_b)
+
                 mean = torch.tensor([-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225])[None, -1, None, None],
                 std = torch.tensor([1 / 0.229, 1 / 0.224, 1 / 0.225])[None, -1, None, None]
-                x_gen = TF.normalize(x_gen, mean=mean, std=std)
-                save_image(x_gen, 'generated_{}.png'.format(epoch))
-                for i, img_i in enumerate(imgs):
-                    img_i = TF.normalize(img_i, mean=mean, std=std)
-                    save_image(img_i, 'generated_scale_{}_{}.png'.format(i, epoch))
-                loss_g_train /= len(loader)
-                loss_d_train /= len(loader)
+                X_a = TF.normalize(X_a, mean=mean, std=std)
+                x_a_gen = TF.normalize(x_a_gen, mean=mean, std=std)
+                X_b = TF.normalize(X_b, mean=mean, std=std)
+                x_b_gen = TF.normalize(x_b_gen, mean=mean, std=std)
 
-                print('Epoch: {}, gen train loss: {}, disc train loss: {}'.format(epoch, loss_g_train, loss_d_train))
+                save_image(X_a, 'images/gt_a_{}.png'.format(epoch))
+                save_image(x_a_gen, 'images/generated_a_{}.png'.format(epoch))
+                save_image(X_b, 'images/gt_b_{}.png'.format(epoch))
+                save_image(x_b_gen, 'images/generated_b_{}.png'.format(epoch))
 
-    torch.save({'generator': generator.state_dict(),
-                'discriminator': discriminator.state_dict(),
+                loss_g_ab_train /= len(loader_a)
+                loss_g_ba_train /= len(loader_b)
+                loss_d_ab_train /= len(loader_a)
+                loss_d_ba_train /= len(loader_b)
+
+                print('Epoch: {}, gen a train loss: {}, gen b train loss: {}, disc a train loss {}, disc b train loss: {}'.format(
+                    epoch, loss_g_ab_train, loss_g_ba_train, loss_d_ab_train, loss_d_ba_train))
+
+    torch.save({'generator_ab': generator_ab.state_dict(),
+                'discriminator_ab': discriminator_ab.state_dict(),
+                'generator_ba': generator_ba.state_dict(),
+                'discriminator_ba': discriminator_ba.state_dict(),
                 'n_epochs': n_epochs,
-                'opt': opt.state_dict()
+                'opt_g_ab': opt_g_ab.state_dict(),
+                'opt_g_ba': opt_g_ba.state_dict(),
+                'opt_d_ab': opt_d_ab.state_dict(),
+                'opt_d_ba': opt_d_ba.state_dict()
                 }, 'vitgan.pth')
 
 
 if __name__ == '__main__':
     device = 'cuda:0'
 
-    mode = 'vitgan'
+    mode = 'cycle'
 
     if mode == 'teacher':
         transform = Compose([Resize(224),
@@ -216,6 +275,14 @@ if __name__ == '__main__':
                              ])
     elif mode == 'vitgan':
         transform = Compose([Resize(224),
+                             RandAugment(),
+                             ToTensor(),
+                             Normalize(mean=[0.485, 0.456, 0.406],
+                                       std=[0.229, 0.224, 0.225])
+                             ])
+    elif mode == 'cycle':
+        transform = Compose([Resize(224),
+                             RandAugment(),
                              ToTensor(),
                              Normalize(mean=[0.485, 0.456, 0.406],
                                        std=[0.229, 0.224, 0.225])
@@ -227,20 +294,42 @@ if __name__ == '__main__':
                                         std=[0.229, 0.224, 0.225])
                               ])
 
-    batch_size = 16
+
+    batch_size = 8
     n_workers = 4
 
     if mode == 'vitgan':
         dataset = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform)
         dataset_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform_test)
+    elif mode == 'cycle':
+        dataset_a = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/train/trainA', transform=transform)
+        dataset_b = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/train/trainB', transform=transform)
+        dataset_a_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/test/testA',
+                                     transform=transform_test)
+        dataset_b_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/test/testB',
+                                     transform=transform_test)
     else:
         dataset = STL10('stl10', transform=transform, split='train', download=True)
         dataset_test = STL10('stl10', transform=transform_test, split='test', download=True)
 
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0), shuffle=True, pin_memory=True)
+    if mode == 'cycle':
+        loader_a = DataLoader(dataset_a, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0),
+                            shuffle=True, pin_memory=True)
 
-    loader_test = DataLoader(dataset_test, batch_size=batch_size, num_workers=n_workers, persistent_workers=False, shuffle=False,
-                             pin_memory=True)
+        loader_a_test = DataLoader(dataset_a_test, batch_size=batch_size, num_workers=0, persistent_workers=False,
+                                 shuffle=True, pin_memory=True)
+
+        loader_b = DataLoader(dataset_b, batch_size=batch_size, num_workers=n_workers,
+                              persistent_workers=(n_workers > 0),
+                              shuffle=True, pin_memory=True)
+
+        loader_b_test = DataLoader(dataset_b_test, batch_size=batch_size, num_workers=0, persistent_workers=False,
+                                   shuffle=True, pin_memory=True)
+    else:
+        loader = DataLoader(dataset, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0), shuffle=True, pin_memory=True)
+
+        loader_test = DataLoader(dataset_test, batch_size=batch_size, num_workers=n_workers, persistent_workers=False, shuffle=False,
+                                 pin_memory=True)
 
     if mode == 'teacher':
         train_teacher(loader, loader_test, device)
@@ -248,6 +337,8 @@ if __name__ == '__main__':
         train_mae(loader, loader_test, device)
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
+    elif mode == 'cycle':
+        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device)
 
 
 

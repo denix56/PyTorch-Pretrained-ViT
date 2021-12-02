@@ -7,6 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def as_tuple(x):
+    return x if isinstance(x, tuple) else (x, x)
+
+
 class SLN(nn.Module):
     """
     Self-modulated LayerNorm
@@ -125,15 +129,14 @@ class GEncoderBlock(nn.Module):
         self.attn = Attention(dim, num_heads, dim_head)
         self.dropout = nn.Dropout(dropout)
 
-        self.norm1 = SLN(dim)
-        self.norm2 = SLN(dim)
-
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, dim * mlp_ratio, dropout = dropout)
 
-    def forward(self, hl, x):
-        hl_temp = self.dropout(self.attn(self.norm1(hl, x))) + hl
-        hl_final = self.mlp(self.norm2(hl_temp, x)) + hl_temp
-        return x, hl_final
+    def forward(self, x):
+        x = self.dropout(self.attn(self.norm1(x))) + x
+        x = self.mlp(self.norm2(x)) + x
+        return x
 
 
 class RGBBlock(nn.Module):
@@ -158,7 +161,6 @@ class RGBBlock(nn.Module):
 class GTransformerEncoder(nn.Module):
     def __init__(self,
         dim,
-        initialize_size,
         blocks = 6,
         num_heads = 8,
         dim_head = None,
@@ -167,10 +169,10 @@ class GTransformerEncoder(nn.Module):
         super(GTransformerEncoder, self).__init__()
         self.blocks = self._make_layers(dim, blocks, num_heads, dim_head, dropout)
 
-        self.rgb_blocks = []
-        for i in range(blocks):
-            self.rgb_blocks.append(RGBBlock(dim, initialize_size*8, 2**(i+1)*8, 3))
-        self.rgb_blocks = nn.ModuleList(self.rgb_blocks)
+        # self.rgb_blocks = []
+        # for i in range(blocks):
+        #     self.rgb_blocks.append(RGBBlock(dim, initialize_size*8, 2**(i+1)*8, 3))
+        # self.rgb_blocks = nn.ModuleList(self.rgb_blocks)
 
 
 
@@ -186,21 +188,10 @@ class GTransformerEncoder(nn.Module):
             layers.append(GEncoderBlock(dim, num_heads, dim_head, dropout))
         return nn.ModuleList(layers)
 
-    def forward(self, hl, x, ret_all_imgs):
-        img = None
-        imgs = []
-        for block, rgb_block in zip(self.blocks, self.rgb_blocks):
-            x, hl = block(hl, x)
-            img_c = rgb_block(x, hl)
-            img_c = img_c.view(img_c.shape[0], img_c.shape[1], img_c.shape[1], -1).permute(0, 3, 1, 2)
-            if img is None:
-                img = img_c
-            else:
-                img = F.interpolate(img, scale_factor=2)
-                img = img + img_c
-            if ret_all_imgs:
-                imgs.append(img_c.detach())
-        return x, img, imgs
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 class DTransformerEncoder(nn.Module):
@@ -214,6 +205,8 @@ class DTransformerEncoder(nn.Module):
         super(DTransformerEncoder, self).__init__()
         self.blocks = self._make_layers(dim, blocks, num_heads, dim_head, dropout)
 
+
+
     def _make_layers(self,
         dim,
         blocks = 6,
@@ -224,7 +217,7 @@ class DTransformerEncoder(nn.Module):
         layers = []
         for _ in range(blocks):
             layers.append(DEncoderBlock(dim, num_heads, dim_head, dropout))
-        return nn.Sequential(*layers)
+        return nn.ModuleList(layers)
 
     def forward(self, x):
         for block in self.blocks:
@@ -242,6 +235,7 @@ class SineLayer(nn.Module):
         self.is_first = is_first
 
         self.in_features = in_features
+
         self.linear = nn.Linear(in_features, out_features, bias=bias)
 
         self.init_weights()
@@ -257,52 +251,84 @@ class SineLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(input))
 
 
+class PositionalEmbedding1D(nn.Module):
+    """Adds (optionally learned) positional embeddings to the inputs."""
+
+    def __init__(self, seq_len, dim):
+        super().__init__()
+        self.pos_embedding = nn.Parameter(torch.zeros(1, seq_len, dim))
+
+    def forward(self, x, mask=None):
+        """Input has shape `(batch_size, seq_len, emb_dim)`"""
+        if mask is None:
+            return x + self.pos_embedding
+        else:
+            return x + self.pos_embedding.expand(x.shape[0], -1, -1)[mask].view(*x.shape)
+
+
 class Generator(nn.Module):
     def __init__(self,
-        initialize_size = 8,
-        dim = 384,
+        image_size = 224,
+        patches = 16,
+        in_channels = 3,
+        dim = 768,
         blocks = 6,
         num_heads = 6,
         dim_head = None,
         dropout = 0,
         out_channels = 3,
-        out_size = 512
     ):
         super(Generator, self).__init__()
-        self.initialize_size = initialize_size
+        h, w = as_tuple(image_size)  # image sizes
+        fh, fw = as_tuple(patches)  # patch sizes
+        gh, gw = h // fh, w // fw  # number of patches
+        seq_len = gh * gw
+
+        self.image_size = (h, w)
+        self.n_patches = (gh, gw)
+
         self.dim = dim
         self.blocks = blocks
         self.num_heads = num_heads
         self.dim_head = dim_head
         self.dropout = dropout
         self.out_channels = out_channels
-        self.out_size = out_size
 
-        self.pos_emb1D = nn.Parameter(torch.randn(self.initialize_size * 8, dim))
+        self.patch_embedding = nn.Conv2d(in_channels, dim, kernel_size=(fh, fw), stride=(fh, fw))
 
-        self.mlp = nn.Linear(1024, (self.initialize_size * 8) * self.dim)
-        self.Transformer_Encoder = GTransformerEncoder(dim, initialize_size, blocks, num_heads, dim_head, dropout)
+        #self.pos_emb1D = nn.Parameter(torch.randn(self.initialize_size * 8, dim))
+        self.pos_emb1D = PositionalEmbedding1D(seq_len, dim)
+        #self.mlp = nn.Linear(1024, (self.initialize_size * 8) * self.dim)
+        self.Transformer_Encoder = GTransformerEncoder(dim, blocks, num_heads, dim_head, dropout)
 
         # Implicit Neural Representation
         # self.w_out = nn.Sequential(
         #     SineLayer(dim, dim * 2, is_first = True, omega_0 = 30.),
-        #     SineLayer(dim * 2, self.initialize_size * 8 * self.out_channels, is_first = False, omega_0 = 30)
+        #     SineLayer(dim * 2, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
         # )
-        # self.sln_norm = SLN(self.dim)
+        self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))
+        self.sln_norm = nn.LayerNorm(self.dim, eps=1e-6)
 
-    def forward(self, noise, ret_all_imgs=False):
-        x = self.mlp(noise).view(-1, self.initialize_size * 8, self.dim)
-        x, img, imgs = self.Transformer_Encoder(self.pos_emb1D, x, ret_all_imgs)
-        # x = self.sln_norm(hl, x)
-        # x = self.w_out(x)  # Replace to siren
-        result = img.view(img.shape[0], 3, self.out_size, self.out_size)
-        return result, imgs
+    def forward(self, x):
+        #x = self.mlp(noise).view(-1, self.initialize_size * 8, self.dim)
+
+        x = self.patch_embedding(x)  # b,d,gh,gw
+        x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
+
+        x = self.pos_emb1D(x)
+        x = self.Transformer_Encoder(x)
+        # x = self.sln_norm(x)
+        x = x.view(-1, *self.n_patches, x.shape[-1]).permute(0, 3, 1, 2)
+        x = self.w_out(x)  # Replace to siren
+        result = x.view(x.shape[0], 3, *self.image_size)
+        return result
 
 
 class Discriminator(nn.Module):
     def __init__(self,
+        image_size=224,
+        patches=16,
         in_channels = 3,
-        patch_size = 8,
         extend_size = 2,
         dim = 384,
         blocks = 6,
@@ -311,8 +337,16 @@ class Discriminator(nn.Module):
         dropout = 0
     ):
         super(Discriminator, self).__init__()
+
+        h, w = as_tuple(image_size)  # image sizes
+        fh, fw = as_tuple(patches)  # patch sizes
+        gh, gw = h // fh, w // fw  # number of patches
+        seq_len = gh * gw
+        assert fh == fw
+        patch_size = fh
+
         self.patch_size = patch_size + 2 * extend_size
-        self.token_dim = in_channels * (self.patch_size ** 2)
+        self.token_dim = in_channels * self.patch_size**2
         self.project_patches = nn.Linear(self.token_dim, dim)
 
         self.emb_dropout = nn.Dropout(dropout)
@@ -328,7 +362,7 @@ class Discriminator(nn.Module):
 
 
     def forward(self, img):
-        # Generate overlappimg image patches
+        # Generate overlapping image patches
         stride_h = (img.shape[2] - self.patch_size) // 8 + 1
         stride_w = (img.shape[3] - self.patch_size) // 8 + 1
         img_patches = img.unfold(2, self.patch_size, stride_h).unfold(3, self.patch_size, stride_w)
