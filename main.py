@@ -124,23 +124,23 @@ def train_mae(loader, loader_test, device):
                 }, 'mae.pth')
 
 
-def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
-    generator_ab = Generator(image_size=224, blocks=3).to(device)
+def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none'):
+    generator_ab = Generator(image_size=224, blocks=3, mode=mode).to(device)
     discriminator_ab = Discriminator(image_size=224, blocks=3).to(device)
-    generator_ba = Generator(image_size=224, blocks=3).to(device)
+    generator_ba = Generator(image_size=224, blocks=3, mode=mode).to(device)
     discriminator_ba = Discriminator(image_size=224, blocks=3).to(device)
 
-    opt_g_ab = torch.optim.Adam(generator_ab.parameters(), betas=(0.0, 0.99), lr=1e-4)
-    opt_d_ab = torch.optim.Adam(discriminator_ab.parameters(), betas=(0.0, 0.99), lr=1e-4)
-    opt_g_ba = torch.optim.Adam(generator_ba.parameters(), betas=(0.0, 0.99), lr=1e-4)
-    opt_d_ba = torch.optim.Adam(discriminator_ba.parameters(), betas=(0.0, 0.99), lr=1e-4)
+    opt_g_ab = torch.optim.Adam(generator_ab.parameters(), lr=1e-4)
+    opt_d_ab = torch.optim.Adam(discriminator_ab.parameters(), lr=1e-4)
+    opt_g_ba = torch.optim.Adam(generator_ba.parameters(), lr=1e-4)
+    opt_d_ba = torch.optim.Adam(discriminator_ba.parameters(), lr=1e-4)
     criterion_mse = nn.MSELoss()
     criterion_mae = nn.L1Loss()
-    #criterion_ns = lambda d_score: -torch.mean(torch.log(torch.sigmoid(d_score) + 1e-8))
 
     n_epochs = 1000
+    img_out_dir = 'images_' + mode
 
-    os.makedirs('images', exist_ok=True)
+    os.makedirs(img_out_dir, exist_ok=True)
 
     for epoch in trange(n_epochs):
         loss_g_ab_train = 0
@@ -168,7 +168,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
             fake = torch.zeros(batch_size, 1, device=device)
 
             opt_d_ab.zero_grad()
-            x_b_gen = generator_ab(X_a)
+            x_b_gen, _ = generator_ab(X_a)
             d_score_valid = discriminator_ab(X_b)
             d_score_fake = discriminator_ab(x_b_gen)
             d_ab_loss = 0.5*(criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
@@ -177,7 +177,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
             loss_d_ab_train += d_ab_loss.item()
 
             opt_d_ba.zero_grad()
-            x_a_gen = generator_ba(X_b)
+            x_a_gen, _ = generator_ba(X_b)
             d_score_valid = discriminator_ba(X_a)
             d_score_fake = discriminator_ba(x_a_gen)
             d_ba_loss = 0.5 * (criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
@@ -189,17 +189,17 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
             opt_g_ab.zero_grad()
             opt_g_ba.zero_grad()
 
-            x_b_gen = generator_ab(X_a)
+            x_b_gen, x_b_flat = generator_ab(X_a)
             d_ab_score_fake = discriminator_ab(x_b_gen)
 
-            x_a_gen = generator_ba(X_b)
+            x_a_gen, x_a_flat = generator_ba(X_b)
             d_ba_score_fake = discriminator_ba(x_a_gen)
 
-            x_a_cyc = generator_ba(x_b_gen)
-            x_b_cyc = generator_ab(x_a_gen)
+            x_a_cyc = generator_ba(x_b_gen, mem=x_b_flat)
+            x_b_cyc = generator_ab(x_a_gen, mem=x_a_flat)
 
             g_ab_loss = criterion_mse(d_ab_score_fake, valid) + lmbda*criterion_mae(x_a_cyc, X_a)
-            g_ba_loss =  + criterion_mse(d_ba_score_fake, valid) + lmbda*criterion_mae(x_b_cyc, X_b)
+            g_ba_loss = criterion_mse(d_ba_score_fake, valid) + lmbda*criterion_mae(x_b_cyc, X_b)
             g_loss = g_ab_loss + g_ba_loss
             g_loss.backward()
             opt_g_ba.step()
@@ -230,10 +230,10 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device):
                 X_b = TF.normalize(X_b, mean=mean, std=std)
                 x_b_gen = TF.normalize(x_b_gen, mean=mean, std=std)
 
-                save_image(X_a, 'images/gt_a_{}.png'.format(epoch))
-                save_image(x_a_gen, 'images/generated_a_{}.png'.format(epoch))
-                save_image(X_b, 'images/gt_b_{}.png'.format(epoch))
-                save_image(x_b_gen, 'images/generated_b_{}.png'.format(epoch))
+                save_image(X_a, os.path.join(img_out_dir, 'gt_a_{}.png').format(epoch))
+                save_image(x_a_gen, os.path.join(img_out_dir, 'generated_a_{}.png').format(epoch))
+                save_image(X_b, os.path.join(img_out_dir, 'gt_b_{}.png').format(epoch))
+                save_image(x_b_gen, os.path.join(img_out_dir, 'generated_b_{}.png').format(epoch))
 
                 loss_g_ab_train /= len(loader_a)
                 loss_g_ba_train /= len(loader_b)
@@ -297,16 +297,17 @@ if __name__ == '__main__':
 
     batch_size = 8
     n_workers = 4
+    root = '/home/dsenkin/Desktop/scratch/monet2photo'
 
     if mode == 'vitgan':
         dataset = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform)
         dataset_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform_test)
     elif mode == 'cycle':
-        dataset_a = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/train/trainA', transform=transform)
-        dataset_b = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/train/trainB', transform=transform)
-        dataset_a_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/test/testA',
+        dataset_a = ImageFolder(os.path.join(root, 'train/trainA'), transform=transform)
+        dataset_b = ImageFolder(os.path.join(root, 'train/trainB'), transform=transform)
+        dataset_a_test = ImageFolder(os.path.join(root, 'test/testA'),
                                      transform=transform_test)
-        dataset_b_test = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/monet2photo/test/testB',
+        dataset_b_test = ImageFolder(os.path.join(root, 'test/testB'),
                                      transform=transform_test)
     else:
         dataset = STL10('stl10', transform=transform, split='train', download=True)

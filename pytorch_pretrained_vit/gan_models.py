@@ -124,18 +124,30 @@ class DEncoderBlock(nn.Module):
 
 class GEncoderBlock(nn.Module):
     def __init__(self, dim, num_heads = 4, dim_head = None,
-        dropout = 0., mlp_ratio = 4):
+        dropout = 0., mlp_ratio = 4, mode='none'):
         super(GEncoderBlock, self).__init__()
-        self.attn = Attention(dim, num_heads, dim_head)
+        assert mode in ['self', 'skip', 'none']
+        self.mode = mode
+        self.attn1 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.attn2 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.dropout = nn.Dropout(dropout)
-
+        self.proj1 = nn.Linear(dim, dim)
+        self.proj2 = nn.Linear(dim, dim)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
         self.mlp = MLP(dim, dim * mlp_ratio, dropout = dropout)
 
-    def forward(self, x):
-        x = self.dropout(self.attn(self.norm1(x))) + x
-        x = self.mlp(self.norm2(x)) + x
+    def forward(self, x, mem):
+        x_norm = self.norm1(x)
+        x = self.dropout(self.proj1(self.attn1(x_norm, x_norm, x_norm)[0])) + x
+        if self.mode != 'none' and mem is not None:
+            x_norm = self.norm2(x)
+            x = self.dropout(self.proj2(self.attn2(x_norm, mem, mem)[0])) + x
+        elif self.mode == 'self':
+            x_norm = self.norm2(x)
+            x = self.dropout(self.proj2(self.attn2(x_norm, x_norm, x_norm)[0])) + x
+        x = self.mlp(self.norm3(x)) + x
         return x
 
 
@@ -165,9 +177,10 @@ class GTransformerEncoder(nn.Module):
         num_heads = 8,
         dim_head = None,
         dropout = 0,
+        mode = 'none'
     ):
         super(GTransformerEncoder, self).__init__()
-        self.blocks = self._make_layers(dim, blocks, num_heads, dim_head, dropout)
+        self.blocks = self._make_layers(dim, blocks, num_heads, dim_head, dropout, mode=mode)
 
         # self.rgb_blocks = []
         # for i in range(blocks):
@@ -188,9 +201,9 @@ class GTransformerEncoder(nn.Module):
             layers.append(GEncoderBlock(dim, num_heads, dim_head, dropout))
         return nn.ModuleList(layers)
 
-    def forward(self, x):
+    def forward(self, x, mem=None):
         for block in self.blocks:
-            x = block(x)
+            x = block(x, mem)
         return x
 
 
@@ -307,7 +320,6 @@ class Generator(nn.Module):
         #     SineLayer(dim * 2, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
         # )
         self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))
-        self.sln_norm = nn.LayerNorm(self.dim, eps=1e-6)
 
     def forward(self, x):
         #x = self.mlp(noise).view(-1, self.initialize_size * 8, self.dim)
@@ -316,12 +328,11 @@ class Generator(nn.Module):
         x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
 
         x = self.pos_emb1D(x)
-        x = self.Transformer_Encoder(x)
-        # x = self.sln_norm(x)
-        x = x.view(-1, *self.n_patches, x.shape[-1]).permute(0, 3, 1, 2)
+        x_flat = self.Transformer_Encoder(x)
+        x = x_flat.view(-1, *self.n_patches, x_flat.shape[-1]).permute(0, 3, 1, 2)
         x = self.w_out(x)  # Replace to siren
         result = x.view(x.shape[0], 3, *self.image_size)
-        return result
+        return result, x_flat
 
 
 class Discriminator(nn.Module):
