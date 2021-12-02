@@ -262,7 +262,10 @@ class SineLayer(nn.Module):
                 self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, np.sqrt(6 / self.in_features) / self.omega_0)
 
     def forward(self, input):
-        return torch.sin(self.omega_0 * self.linear(input))
+        if self.is_first:
+            return torch.sin(self.omega_0 * self.linear(input))
+        else:
+            return self.linear(input)
 
 
 class PositionalEmbedding1D(nn.Module):
