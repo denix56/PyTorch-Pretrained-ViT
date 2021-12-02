@@ -245,16 +245,17 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
                 print('Epoch: {}, gen a train loss: {}, gen b train loss: {}, disc a train loss {}, disc b train loss: {}'.format(
                     epoch, loss_g_ab_train, loss_g_ba_train, loss_d_ab_train, loss_d_ba_train))
 
-    torch.save({'generator_ab': generator_ab.state_dict(),
-                'discriminator_ab': discriminator_ab.state_dict(),
-                'generator_ba': generator_ba.state_dict(),
-                'discriminator_ba': discriminator_ba.state_dict(),
-                'n_epochs': n_epochs,
-                'opt_g_ab': opt_g_ab.state_dict(),
-                'opt_g_ba': opt_g_ba.state_dict(),
-                'opt_d_ab': opt_d_ab.state_dict(),
-                'opt_d_ba': opt_d_ba.state_dict()
-                }, 'vitgan.pth')
+        if epoch % 5000 == 0:
+            torch.save({'generator_ab': generator_ab.state_dict(),
+                        'discriminator_ab': discriminator_ab.state_dict(),
+                        'generator_ba': generator_ba.state_dict(),
+                        'discriminator_ba': discriminator_ba.state_dict(),
+                        'epoch': epoch,
+                        'opt_g_ab': opt_g_ab.state_dict(),
+                        'opt_g_ba': opt_g_ba.state_dict(),
+                        'opt_d_ab': opt_d_ab.state_dict(),
+                        'opt_d_ba': opt_d_ba.state_dict()
+                        }, ('cycle_vitgan_{}_' + mode + ('_siren' if use_siren else '') + '.pth').format(epoch))
 
 
 if __name__ == '__main__':
