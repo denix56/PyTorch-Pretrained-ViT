@@ -139,7 +139,8 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
     criterion_mae = nn.L1Loss()
 
     n_epochs = 10000
-    img_out_dir = '/home/dsenkin/Desktop/scratch/images_' + mode + ('_siren' if use_siren else '')
+    out_dir = '/home/dsenkin/Desktop/scratch/vit'
+    img_out_dir = os.path.join(out_dir, 'images_' + mode + ('_siren' if use_siren else ''))
 
     shutil.rmtree(img_out_dir, ignore_errors=True)
     os.makedirs(img_out_dir, exist_ok=True)
@@ -255,7 +256,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
                         'opt_g_ba': opt_g_ba.state_dict(),
                         'opt_d_ab': opt_d_ab.state_dict(),
                         'opt_d_ba': opt_d_ba.state_dict()
-                        }, ('cycle_vitgan_{}_' + mode + ('_siren' if use_siren else '') + '.pth').format(epoch))
+                        }, os.path.join(out_dir, ('cycle_vitgan_{}_' + mode + ('_siren' if use_siren else '') + '.pth').format(epoch)))
 
 
 if __name__ == '__main__':
