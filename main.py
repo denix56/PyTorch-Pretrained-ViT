@@ -195,8 +195,8 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='no
             x_a_gen, x_a_flat = generator_ba(X_b)
             d_ba_score_fake = discriminator_ba(x_a_gen)
 
-            x_a_cyc = generator_ba(x_b_gen, mem=x_b_flat)
-            x_b_cyc = generator_ab(x_a_gen, mem=x_a_flat)
+            x_a_cyc, _ = generator_ba(x_b_gen, mem=x_b_flat)
+            x_b_cyc, _ = generator_ab(x_a_gen, mem=x_a_flat)
 
             g_ab_loss = criterion_mse(d_ab_score_fake, valid) + lmbda*criterion_mae(x_a_cyc, X_a)
             g_ba_loss = criterion_mse(d_ba_score_fake, valid) + lmbda*criterion_mae(x_b_cyc, X_b)
@@ -220,8 +220,8 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='no
                 X_a = X_a.to(device)
                 X_b = X_b.to(device)
 
-                x_b_gen = generator_ab(X_a)
-                x_a_gen = generator_ba(X_b)
+                x_b_gen, _ = generator_ab(X_a)
+                x_a_gen, _ = generator_ba(X_b)
 
                 mean = torch.tensor([-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225])[None, -1, None, None],
                 std = torch.tensor([1 / 0.229, 1 / 0.224, 1 / 0.225])[None, -1, None, None]
