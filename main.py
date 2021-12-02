@@ -125,9 +125,9 @@ def train_mae(loader, loader_test, device):
 
 
 def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none'):
-    generator_ab = Generator(image_size=224, blocks=3, mode=mode).to(device)
+    generator_ab = Generator(image_size=224, blocks=3, mode=mode, use_siren=False).to(device)
     discriminator_ab = Discriminator(image_size=224, blocks=3).to(device)
-    generator_ba = Generator(image_size=224, blocks=3, mode=mode).to(device)
+    generator_ba = Generator(image_size=224, blocks=3, mode=mode, use_siren=False).to(device)
     discriminator_ba = Discriminator(image_size=224, blocks=3).to(device)
 
     opt_g_ab = torch.optim.Adam(generator_ab.parameters(), lr=1e-4)

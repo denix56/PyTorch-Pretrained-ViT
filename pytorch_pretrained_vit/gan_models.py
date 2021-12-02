@@ -291,7 +291,8 @@ class Generator(nn.Module):
         dim_head = None,
         dropout = 0,
         out_channels = 3,
-        mode = 'none'
+        mode = 'none',
+        use_siren = False
     ):
         super(Generator, self).__init__()
         h, w = as_tuple(image_size)  # image sizes
@@ -299,6 +300,7 @@ class Generator(nn.Module):
         gh, gw = h // fh, w // fw  # number of patches
         seq_len = gh * gw
 
+        self.use_siren = use_siren
         self.image_size = (h, w)
         self.n_patches = (gh, gw)
 
@@ -317,11 +319,14 @@ class Generator(nn.Module):
         self.Transformer_Encoder = GTransformerEncoder(dim, blocks, num_heads, dim_head, dropout, mode=mode)
 
         # Implicit Neural Representation
-        # self.w_out = nn.Sequential(
-        #     SineLayer(dim, dim * 2, is_first = True, omega_0 = 30.),
-        #     SineLayer(dim * 2, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
-        # )
-        self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))
+        if self.use_siren:
+            self.w_out = nn.Sequential(
+                nn.LayerNorm(dim),
+                SineLayer(dim, dim * 2, is_first = True, omega_0 = 30.),
+                SineLayer(dim * 2, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
+            )
+        else:
+            self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))
 
     def forward(self, x, mem=None):
         #x = self.mlp(noise).view(-1, self.initialize_size * 8, self.dim)
@@ -331,7 +336,8 @@ class Generator(nn.Module):
 
         x = self.pos_emb1D(x)
         x_flat = self.Transformer_Encoder(x, mem=mem)
-        x = x_flat.view(-1, *self.n_patches, x_flat.shape[-1]).permute(0, 3, 1, 2)
+        if not self.use_siren:
+            x = x_flat.view(-1, *self.n_patches, x_flat.shape[-1]).permute(0, 3, 1, 2)
         x = self.w_out(x)  # Replace to siren
         result = x.view(x.shape[0], 3, *self.image_size)
         return result, x_flat
