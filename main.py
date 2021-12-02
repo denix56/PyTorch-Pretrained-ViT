@@ -137,7 +137,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='no
     criterion_mse = nn.MSELoss()
     criterion_mae = nn.L1Loss()
 
-    n_epochs = 1000
+    n_epochs = 10000
     img_out_dir = 'images_' + mode
 
     os.makedirs(img_out_dir, exist_ok=True)
@@ -295,7 +295,7 @@ if __name__ == '__main__':
                               ])
 
 
-    batch_size = 8
+    batch_size = 32
     n_workers = 4
     root = '/home/dsenkin/Desktop/scratch/monet2photo'
 
@@ -339,7 +339,7 @@ if __name__ == '__main__':
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
     elif mode == 'cycle':
-        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device)
+        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none')
 
 
 
