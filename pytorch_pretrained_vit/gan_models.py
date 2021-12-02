@@ -202,7 +202,7 @@ class GTransformerEncoder(nn.Module):
             layers.append(GEncoderBlock(dim, num_heads, dim_head, dropout, mode=mode))
         return nn.ModuleList(layers)
 
-    def forward(self, x, mem=None):
+    def forward(self, x, mem):
         for block in self.blocks:
             x = block(x, mem)
         return x
@@ -323,14 +323,14 @@ class Generator(nn.Module):
         # )
         self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))
 
-    def forward(self, x):
+    def forward(self, x, mem=None):
         #x = self.mlp(noise).view(-1, self.initialize_size * 8, self.dim)
 
         x = self.patch_embedding(x)  # b,d,gh,gw
         x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
 
         x = self.pos_emb1D(x)
-        x_flat = self.Transformer_Encoder(x)
+        x_flat = self.Transformer_Encoder(x, mem=mem)
         x = x_flat.view(-1, *self.n_patches, x_flat.shape[-1]).permute(0, 3, 1, 2)
         x = self.w_out(x)  # Replace to siren
         result = x.view(x.shape[0], 3, *self.image_size)
