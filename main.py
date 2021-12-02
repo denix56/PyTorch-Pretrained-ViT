@@ -124,10 +124,10 @@ def train_mae(loader, loader_test, device):
                 }, 'mae.pth')
 
 
-def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none'):
-    generator_ab = Generator(image_size=224, blocks=3, mode=mode, use_siren=False).to(device)
+def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=False):
+    generator_ab = Generator(image_size=224, blocks=3, mode=mode, use_siren=use_siren).to(device)
     discriminator_ab = Discriminator(image_size=224, blocks=3).to(device)
-    generator_ba = Generator(image_size=224, blocks=3, mode=mode, use_siren=False).to(device)
+    generator_ba = Generator(image_size=224, blocks=3, mode=mode, use_siren=use_siren).to(device)
     discriminator_ba = Discriminator(image_size=224, blocks=3).to(device)
 
     opt_g_ab = torch.optim.Adam(generator_ab.parameters(), lr=1e-4)
@@ -138,7 +138,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='no
     criterion_mae = nn.L1Loss()
 
     n_epochs = 10000
-    img_out_dir = 'images_' + mode
+    img_out_dir = '/home/dsenkin/Desktop/scratch/images_' + mode + ('_siren' if use_siren else '')
 
     os.makedirs(img_out_dir, exist_ok=True)
 
@@ -339,7 +339,7 @@ if __name__ == '__main__':
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
     elif mode == 'cycle':
-        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none')
+        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=True)
 
 
 
