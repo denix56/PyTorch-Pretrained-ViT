@@ -339,7 +339,7 @@ if __name__ == '__main__':
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
     elif mode == 'cycle':
-        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=True)
+        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=False)
 
 
 

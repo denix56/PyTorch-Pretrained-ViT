@@ -126,7 +126,7 @@ class GEncoderBlock(nn.Module):
     def __init__(self, dim, num_heads = 4, dim_head = None,
         dropout = 0., mlp_ratio = 4, mode='none'):
         super(GEncoderBlock, self).__init__()
-        assert mode in ['self', 'skip', 'none']
+        assert mode in ['self', 'skip', 'none', 'skip_value', 'self_value']
         self.mode = mode
         self.attn1 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.attn2 = nn.MultiheadAttention(dim, num_heads, batch_first=True)
@@ -143,7 +143,10 @@ class GEncoderBlock(nn.Module):
         x = self.dropout(self.proj1(self.attn1(x_norm, x_norm, x_norm)[0])) + x
         if self.mode != 'none' and mem is not None:
             x_norm = self.norm2(x)
-            x = self.dropout(self.proj2(self.attn2(x_norm, mem, mem)[0])) + x
+            if 'value' in self.mode:
+                x = self.dropout(self.proj2(self.attn2(mem, mem, x_norm)[0])) + x
+            else:
+                x = self.dropout(self.proj2(self.attn2(x_norm, mem, mem)[0])) + x
         elif self.mode == 'self':
             x_norm = self.norm2(x)
             x = self.dropout(self.proj2(self.attn2(x_norm, x_norm, x_norm)[0])) + x
