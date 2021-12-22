@@ -15,6 +15,89 @@ import shutil
 
 from pytorch_pretrained_vit.gan_models import Generator, Discriminator
 
+import pytorch_lightning as pl
+from torchmetrics.image.lpip_similarity import LPIPS
+from torchmetrics import PSNR, MeanSquaredError, MetricCollection
+
+
+class MAE(pl.LightningModule):
+    def __init__(self, lr:float = 1e-4, mask_rate:float = 0.75):
+        super().__init__()
+        self.lr = lr
+        self.mask_rate = mask_rate
+
+        self.encoder = ViT('encoder', distilled=True, image_size=224)
+        self.decoder = ViT('decoder', distilled=True, use_mask_token=True, num_layers=4, num_heads=6, ff_dim=1536,
+                      image_size=224)
+
+        self.criterion = nn.MSELoss()
+
+        self.metrics_train = MetricCollection([
+            MeanSquaredError(),
+            PSNR(data_range=2)
+        ], prefix='train/')
+
+        self.metrics_val = MetricCollection([
+            MeanSquaredError(compute_on_step=False),
+            PSNR(data_range=2, compute_on_step=False),
+        ], prefix='val/')
+
+        self.lpips_metric = LPIPS(compute_on_step=False)
+
+        self.save_hyperparameters()
+
+        self.example_input_array = torch.rand(1, 3, 224, 224)
+
+    def forward(self, x):
+        out, mask = self.encoder(x, mask_rate=self.mask_rate)
+        dec_out, _ = self.decoder(out, enc_mask=mask)
+
+        return dec_out
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        out, mask = self.encoder(x, mask_rate=self.mask_rate)
+        dec_out, _ = self.decoder(out, enc_mask=mask)
+        loss = self.criterion(dec_out, x)
+        self.log('Loss', loss)
+        metrics_out = self.metrics_train(dec_out, x)
+        self.log_dict(metrics_out)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        out, mask = self.encoder(x, mask_rate=self.mask_rate)
+        dec_out, _ = self.decoder(out, enc_mask=mask)
+
+        self.metrics_val(dec_out, x)
+
+        mean = torch.tensor([-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225])[None, -1, None, None],
+        std = torch.tensor([1 / 0.229, 1 / 0.224, 1 / 0.225])[None, -1, None, None]
+        x = TF.normalize(x, mean=mean, std=std)
+        x_min = torch.amin(x, dim=(2, 3), keepdim=True)
+        x_max = torch.amax(x, dim=(2, 3), keepdim=True)
+        x_norm = (x - x_min) / (x_max - x_min) * 2 - 1
+        dec_out = TF.normalize(dec_out, mean=mean, std=std)
+        dec_out_min = torch.amin(dec_out, dim=(2, 3), keepdim=True)
+        dec_out_max = torch.amax(dec_out, dim=(2, 3), keepdim=True)
+        dec_out_norm = (dec_out - dec_out_min) / (dec_out_max - dec_out_min) * 2 - 1
+
+        self.lpips_metric(dec_out_norm, x_norm)
+
+        if batch_idx == 0:
+            self.logger.experiment.add_images('GT', x, global_step=self.global_step)
+            self.logger.experiment.add_images('Reconstructed', dec_out, global_step=self.global_step)
+
+    def on_validation_epoch_end(self):
+        metrics_out = self.metrics_val.compute()
+        metrics_out['val/LPIPS'] = self.lpips_metric.compute()
+        self.log_dict(metrics_out)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.lr)
+
 
 def train_teacher(loader, loader_test, device):
     regnet_y_16gf = models.regnet_y_16gf(pretrained=True)
@@ -65,64 +148,19 @@ def train_teacher(loader, loader_test, device):
 
 
 def train_mae(loader, loader_test, device):
-    encoder = ViT('encoder', distilled=True, image_size=224).to(device)
-    decoder = ViT('decoder', distilled=True, use_mask_token=True, num_layers=4, num_heads=6, ff_dim=1536,
-                  image_size=224).to(device)
+    model = MAE()
 
-    opt = torch.optim.Adam(chain(encoder.parameters(), decoder.parameters()), lr=1e-4)
-    criterion = nn.MSELoss()
+    logger = pl.loggers.TensorBoardLogger(save_dir='tb_log', log_graph=True)
+    ms = pl.callbacks.ModelSummary(max_depth=7)
+    cpt = pl.callbacks.ModelCheckpoint(dirpath='cpts', save_last=True, every_n_epochs=10)
+    stats = pl.callbacks.DeviceStatsMonitor()
 
-    n_epochs = 200
-
-    for epoch in trange(n_epochs):
-        loss_train = 0
-        encoder.train()
-        decoder.train()
-        for batch_i, (X, y) in tqdm(enumerate(loader), total=len(loader)):
-            X = X.to(device)
-            y = y.to(device)
-
-            opt.zero_grad()
-            out, mask = encoder(X, mask_rate=0.75)
-            dec_out, _ = decoder(out, enc_mask=mask)
-            loss = criterion(dec_out, X)
-            loss.backward()
-            opt.step()
-
-            loss_train += loss.item()
-
-        if epoch % 20 == 0:
-            with torch.no_grad():
-                encoder.eval()
-                decoder.eval()
-                loss_test = 0
-                for batch_i, (X, y) in tqdm(enumerate(loader_test), total=len(loader_test), desc='Testing'):
-                    X = X.to(device)
-                    y = y.to(device)
-
-                    out, mask = encoder(X, mask_rate=0.75)
-                    dec_out, _ = decoder(out, enc_mask=mask)
-                    loss = criterion(dec_out, X)
-
-                    if batch_i == 0:
-                        mean = torch.tensor([-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225])[None, -1, None, None],
-                        std = torch.tensor([1 / 0.229, 1 / 0.224, 1 / 0.225])[None, -1, None, None]
-                        X = TF.normalize(X, mean=mean, std=std)
-                        dec_out = TF.normalize(dec_out, mean=mean, std=std)
-                        save_image(X, 'gt_{}.png'.format(epoch))
-                        save_image(dec_out, 'rec_{}.png'.format(epoch))
-
-                    loss_test += loss.item()
-                loss_train /= len(loader)
-                loss_test /= len(loader_test)
-
-                print('Epoch: {}, train loss: {}, test loss: {}'.format(epoch, loss_train, loss_test))
-
-    torch.save({'encoder': encoder.state_dict(),
-                'decoder': decoder.state_dict(),
-                'n_epochs': n_epochs,
-                'opt': opt.state_dict()
-                }, 'mae.pth')
+    trainer = pl.Trainer(logger=logger, gpus=1, callbacks=[ms, cpt, stats],
+                         max_epochs=200, log_every_n_steps=10,
+                         fast_dev_run=False)
+    trainer.fit(model,
+                train_dataloaders=loader,
+                val_dataloaders=loader_test)
 
 
 def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6, mode='none', use_siren=False):
@@ -262,7 +300,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
 if __name__ == '__main__':
     device = 'cuda:0'
 
-    mode = 'cycle'
+    mode = 'mae'
 
     if mode == 'teacher':
         transform = Compose([Resize(224),

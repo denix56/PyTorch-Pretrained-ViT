@@ -255,7 +255,7 @@ class SineLayer(nn.Module):
 
         self.linear = nn.Linear(in_features, out_features, bias=bias)
 
-        self.init_weights()
+        # self.init_weights()
 
     def init_weights(self):
         with torch.no_grad():
@@ -265,10 +265,10 @@ class SineLayer(nn.Module):
                 self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, np.sqrt(6 / self.in_features) / self.omega_0)
 
     def forward(self, input):
-        if self.is_first:
-            return torch.sin(self.omega_0 * self.linear(input))
-        else:
-            return self.linear(input)
+        #if self.is_first:
+        #    return torch.sin(self.omega_0 * self.linear(input))
+        #else:
+        return self.linear(input)
 
 
 class PositionalEmbedding1D(nn.Module):
@@ -327,9 +327,9 @@ class Generator(nn.Module):
         # Implicit Neural Representation
         if self.use_siren:
             self.w_out = nn.Sequential(
-                nn.LayerNorm(dim),
-                SineLayer(dim, dim * 2, is_first = True, omega_0 = 30.),
-                SineLayer(dim * 2, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
+                #nn.LayerNorm(dim),
+                #SineLayer(dim, dim * 2, is_first = True, omega_0 = 30.),
+                SineLayer(dim, fh * fw * self.out_channels, is_first = False, omega_0 = 30)
             )
         else:
             self.w_out = nn.ConvTranspose2d(dim, self.out_channels, kernel_size=(fh, fw), stride=(fh, fw))

@@ -197,7 +197,7 @@ class ViT(nn.Module):
             nn.init.constant_(self.mask_token, 0)
 
 
-    def forward(self, x, mask_rate:float = 0.0, enc_mask=None):
+    def forward(self, x, mask_rate:float = 0.0, in_mask=None, enc_mask=None):
         """Breaks image into patches, applies transformer, applies MLP head.
 
         Args:
@@ -215,6 +215,8 @@ class ViT(nn.Module):
                 mask = torch.zeros(*x.shape[:2], dtype=bool, device=x.device)
                 mask.scatter_(1, mask_indices, 1)
                 x = x[mask].view(b, -1, x.shape[2])
+            elif in_mask is not None:
+                mask = in_mask
 
             add_patches = 0
             if hasattr(self, 'class_token'):
