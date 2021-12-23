@@ -78,6 +78,7 @@ class ViT(nn.Module):
         use_mask_token: bool = False,
         image_size: Optional[int] = None,
         num_classes: Optional[int] = None,
+        mask_gen = False
     ):
         super().__init__()
 
@@ -118,12 +119,13 @@ class ViT(nn.Module):
         self.gw = gw
         self.distilled = distilled
         self.use_mask_token = use_mask_token
+        self.mask_gen = mask_gen
 
         # Patch embedding
         self.patch_embedding = nn.Conv2d(in_channels, dim, kernel_size=(fh, fw), stride=(fh, fw))
 
         # Class token
-        if classifier == 'token':
+        if classifier == 'token' and not self.mask_gen:
             self.has_cls_token = True
             if not self.use_mask_token:
                 self.class_token = nn.Parameter(torch.zeros(1, 1, dim))
@@ -131,7 +133,7 @@ class ViT(nn.Module):
         else:
             self.has_cls_token = False
 
-        if distilled:
+        if distilled and not self.mask_gen:
             if not self.use_mask_token:
                 self.dist_token = nn.Parameter(torch.zeros(1, 1, dim))
             seq_len += 1
@@ -140,6 +142,9 @@ class ViT(nn.Module):
             self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
             self.patch_norm = MaskTransLayerNorm(dim)
             self.unconv = nn.ConvTranspose2d(dim, in_channels, kernel_size=(fh, fw), stride=(fh, fw))
+        if mask_gen:
+            self.patch_norm = nn.LayerNorm(dim, eps=1e-6)
+            self.unconv = nn.Linear(dim, 1)
         
         # Positional embedding
         if positional_embedding.lower() == '1d':
@@ -150,17 +155,18 @@ class ViT(nn.Module):
         # Transformer
         self.transformer = Transformer(num_layers=num_layers, dim=dim, num_heads=num_heads, 
                                        ff_dim=ff_dim, dropout=dropout_rate)
-        
-        # Representation layer
-        if representation_size and load_repr_layer:
-            self.pre_logits = nn.Linear(dim, representation_size)
-            pre_logits_size = representation_size
-        else:
-            pre_logits_size = dim
 
-        # Classifier head
-        self.norm = nn.LayerNorm(pre_logits_size, eps=1e-6)
-        self.fc = nn.Linear(pre_logits_size, num_classes)
+        if not mask_gen:
+            # Representation layer
+            if representation_size and load_repr_layer:
+                self.pre_logits = nn.Linear(dim, representation_size)
+                pre_logits_size = representation_size
+            else:
+                pre_logits_size = dim
+
+            # Classifier head
+            self.norm = nn.LayerNorm(pre_logits_size, eps=1e-6)
+            self.fc = nn.Linear(pre_logits_size, num_classes)
 
         # Initialize weights
         self.init_weights()
@@ -177,17 +183,20 @@ class ViT(nn.Module):
                 load_repr_layer=load_repr_layer,
                 resize_positional_embedding=(image_size != pretrained_image_size),
             )
+
+        self.mask_gen = mask_gen
         
     @torch.no_grad()
     def init_weights(self):
         def _init(m):
-            if isinstance(m, nn.Linear):
+            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
                 nn.init.xavier_uniform_(m.weight)  # _trunc_normal(m.weight, std=0.02)  # from .initialization import _trunc_normal
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.normal_(m.bias, std=1e-6)  # nn.init.constant(m.bias, 0)
         self.apply(_init)
-        nn.init.constant_(self.fc.weight, 0)
-        nn.init.constant_(self.fc.bias, 0)
+        if hasattr(self, 'fc'):
+            nn.init.constant_(self.fc.weight, 0)
+            nn.init.constant_(self.fc.bias, 0)
         nn.init.normal_(self.positional_embedding.pos_embedding, std=0.02)  # _trunc_normal(self.positional_embedding.pos_embedding, std=0.02)
         if hasattr(self, 'class_token'):
             nn.init.constant_(self.class_token, 0)
@@ -197,40 +206,48 @@ class ViT(nn.Module):
             nn.init.constant_(self.mask_token, 0)
 
 
-    def forward(self, x, mask_rate:float = 0.0, in_mask=None, enc_mask=None):
+    def forward(self, x, mask_rate:float = 0.0, mask=None, lengths=None):
         """Breaks image into patches, applies transformer, applies MLP head.
 
         Args:
             x (tensor): `b,c,fh,fw`
         """
-        mask = None
-        if not self.use_mask_token:
+
+        if not self.use_mask_token or self.mask_gen:
             b, c, fh, fw = x.shape
             x = self.patch_embedding(x)  # b,d,gh,gw
             x = x.flatten(2).transpose(1, 2)  # b,gh*gw,d
-            if mask_rate > 0.0:
-                rng = np.random.default_rng()
-                mask_indices = torch.multinomial(torch.full((1, x.shape[1]), 1/x.shape[1], device=x.device).expand(b, -1),
-                                                 int((1-mask_rate)*x.shape[1]))
-                mask = torch.zeros(*x.shape[:2], dtype=bool, device=x.device)
-                mask.scatter_(1, mask_indices, 1)
-                x = x[mask].view(b, -1, x.shape[2])
-            elif in_mask is not None:
-                mask = in_mask
+            if not self.mask_gen:
+                if mask_rate > 0.0:
+                    mask_indices = torch.multinomial(torch.full((1, x.shape[1]), 1/x.shape[1], device=x.device).expand(b, -1),
+                                                     int((1-mask_rate)*x.shape[1]))
+                    mask = torch.zeros(*x.shape[:2], dtype=bool, device=x.device)
+                    mask.scatter_(1, mask_indices, 1)
+                    x = x[mask].view(b, -1, x.shape[2])
+                elif mask is not None:
+                    x = x*mask
+                    #mask_b = mask.squeeze(-1) > 0
+                    #x = [x[i, mask_b[i]] for i in range(x.shape[0])]
+                    #max_len = max(x, key=lambda x: x.shape[0])
 
-            add_patches = 0
-            if hasattr(self, 'class_token'):
-                add_patches += 1
-                if not self.distilled:
-                    x = torch.cat((self.class_token.expand(b, -1, -1), x), dim=1)  # b,gh*gw+1,d
+                    #print(x.shape)
+                    #x = x.view(b, -1, x.shape[-1])
                 else:
+                    raise NotImplementedError()
+
+                add_patches = 0
+                if hasattr(self, 'class_token'):
                     add_patches += 1
-                    x = torch.cat((self.class_token.expand(b, -1, -1), self.dist_token.expand(b, -1, -1), x),
-                                  dim=1)  # b,gh*gw+2,d
-            if mask is not None and add_patches > 0:
-                mask = torch.cat((torch.ones(b, add_patches, dtype=bool, device=mask.device), mask), dim=1)
+                    if not self.distilled:
+                        x = torch.cat((self.class_token.expand(b, -1, -1), x), dim=1)  # b,gh*gw+1,d
+                    else:
+                        add_patches += 1
+                        x = torch.cat((self.class_token.expand(b, -1, -1), self.dist_token.expand(b, -1, -1), x),
+                                      dim=1)  # b,gh*gw+2,d
+                if mask is not None and add_patches > 0:
+                    mask = torch.cat((torch.ones(b, add_patches, 1, device=mask.device), mask), dim=1)
         else:
-            assert enc_mask is not None
+            assert mask is not None
             aux_patches = 0
             if self.has_cls_token:
                 aux_patches += 1
@@ -238,28 +255,43 @@ class ViT(nn.Module):
                 aux_patches += 1
 
             x_new = self.mask_token.repeat(x.shape[0], self.gh*self.gw + aux_patches, 1)
-            x_new[enc_mask] = x.flatten(0, 1)
+            x_new = x_new*(1-mask)
+            x = torch.cat([t[:length] for t, length in zip(x, lengths)], dim=0)
+            mask_b = mask.squeeze(-1) > 0
+            x_new[mask_b] = x
             x = x_new
 
         if hasattr(self, 'positional_embedding'):
-            x = self.positional_embedding(x, mask)  # b,gh*gw+1(2),d
+            x = self.positional_embedding(x)  # b,gh*gw+1(2),d
+
+        if mask is not None and not self.use_mask_token:
+            mask_b = mask.squeeze(-1) > 0
+            x = [x[i, mask_b[i]] for i in range(x.shape[0])]
+            lengths = torch.tensor([t.shape[0] for t in x])
+            x = nn.utils.rnn.pad_sequence(x, batch_first=True)
+
         x = self.transformer(x)  # b,gh*gw+1(2),d
 
         if self.use_mask_token:
             x = self.patch_norm(x[:, aux_patches:])
             x = x.view(-1, self.gh, self.gw, x.shape[-1]).permute(0, 3, 1, 2)
             x = self.unconv(x)
+        elif self.mask_gen:
+            x = self.patch_norm(x)
+            x = x.view(-1, self.gh*self.gw, x.shape[-1])
+            x = self.unconv(x)
+            x = torch.sigmoid(x)
 
-        if mask is None and enc_mask is None:
+        if mask is None:
             if hasattr(self, 'pre_logits'):
                 x = self.pre_logits(x)
                 x = torch.tanh(x)
             if hasattr(self, 'fc'):
                 x = self.norm(x)[:, 0]  # b,d
                 x = self.fc(x)  # b,num_classes
-        elif enc_mask is None:
+        elif not self.use_mask_token:
             x = self.norm(x)
-        return x, mask
+        return x, mask, lengths
 
 
 

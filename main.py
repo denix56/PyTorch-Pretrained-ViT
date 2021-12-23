@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 from itertools import chain
 import os
+import sys
 import shutil
 
 from pytorch_pretrained_vit.gan_models import Generator, Discriminator
@@ -21,14 +22,17 @@ from torchmetrics import PSNR, MeanSquaredError, MetricCollection
 
 
 class MAE(pl.LightningModule):
-    def __init__(self, lr:float = 1e-4, mask_rate:float = 0.75):
+    def __init__(self, lr: float = 1e-4, mask_rate: float = 0.75, root:str = ''):
         super().__init__()
         self.lr = lr
         self.mask_rate = mask_rate
+        self.root = root
 
+        self.mask_generator = ViT('mask_generator', distilled=False, num_layers=4, num_heads=6, ff_dim=1536,
+                                  image_size=224, mask_gen=True)
         self.encoder = ViT('encoder', distilled=True, image_size=224)
         self.decoder = ViT('decoder', distilled=True, use_mask_token=True, num_layers=4, num_heads=6, ff_dim=1536,
-                      image_size=224)
+                           image_size=224)
 
         self.criterion = nn.MSELoss()
 
@@ -44,32 +48,55 @@ class MAE(pl.LightningModule):
 
         self.lpips_metric = LPIPS(compute_on_step=False)
 
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore='root')
 
         self.example_input_array = torch.rand(1, 3, 224, 224)
 
     def forward(self, x):
-        out, mask = self.encoder(x, mask_rate=self.mask_rate)
-        dec_out, _ = self.decoder(out, enc_mask=mask)
+        mask_probs, _, _ = self.mask_generator(x)
+        mask = torch.bernoulli(mask_probs)
+        mask = mask_probs + (mask - mask_probs).detach()
+        out, mask, lengths = self.encoder(x, mask=mask)
+        dec_out, _, _ = self.decoder(out, mask=mask, lengths=lengths)
 
         return dec_out
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx, optimizer_idx):
         x, y = batch
 
-        out, mask = self.encoder(x, mask_rate=self.mask_rate)
-        dec_out, _ = self.decoder(out, enc_mask=mask)
-        loss = self.criterion(dec_out, x)
-        self.log('Loss', loss)
-        metrics_out = self.metrics_train(dec_out, x)
-        self.log_dict(metrics_out)
+        if optimizer_idx == 0:
+            mask_probs, _, _ = self.mask_generator(x)
+            mask = torch.bernoulli(mask_probs)
+
+            mask = mask_probs + (mask - mask_probs).detach()
+
+            out, enc_mask, lengths = self.encoder(x, mask=mask)
+            dec_out, _, _ = self.decoder(out, mask=enc_mask, lengths=lengths)
+
+            loss = -self.criterion(dec_out, x) + torch.mean((torch.mean(mask, dim=(1, 2)) - 0.25).abs())
+
+        elif optimizer_idx == 1:
+            mask_probs, _, _ = self.mask_generator(x)
+            mask = torch.bernoulli(mask_probs)
+
+            out, mask, lengths = self.encoder(x, mask=mask)
+            dec_out, _, _ = self.decoder(out, mask=mask, lengths=lengths)
+
+            loss = self.criterion(dec_out, x)
+
+            self.log('Loss', loss)
+            metrics_out = self.metrics_train(dec_out, x)
+            self.log_dict(metrics_out)
 
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        out, mask = self.encoder(x, mask_rate=self.mask_rate)
-        dec_out, _ = self.decoder(out, enc_mask=mask)
+
+        mask_probs, _, _ = self.mask_generator(x)
+        mask = torch.bernoulli(mask_probs)
+        out, mask, lengths = self.encoder(x, mask=mask)
+        dec_out, _, _ = self.decoder(out, mask=mask, lengths=lengths)
 
         self.metrics_val(dec_out, x)
 
@@ -89,6 +116,12 @@ class MAE(pl.LightningModule):
         if batch_idx == 0:
             self.logger.experiment.add_images('GT', x, global_step=self.global_step)
             self.logger.experiment.add_images('Reconstructed', dec_out, global_step=self.global_step)
+            self.logger.experiment.add_images('Mask probs', mask_probs.view(-1, 1, self.mask_generator.gh, self.mask_generator.gw),
+                                              global_step=self.global_step)
+
+            save_image(x, os.path.join(self.root, 'imgs/gt_{}.jpg'.format(self.current_epoch)))
+            save_image(dec_out, os.path.join(self.root, 'imgs/rec_{}.jpg'.format(self.current_epoch)))
+            save_image(mask_probs, os.path.join(self.root, 'imgs/mp_{}.jpg'.format(self.current_epoch)))
 
     def on_validation_epoch_end(self):
         metrics_out = self.metrics_val.compute()
@@ -96,7 +129,9 @@ class MAE(pl.LightningModule):
         self.log_dict(metrics_out)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.lr)
+        opt1 = torch.optim.Adam(self.mask_generator.parameters(), lr=self.lr)
+        opt2 = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.lr)
+        return [opt1, opt2]
 
 
 def train_teacher(loader, loader_test, device):
@@ -147,17 +182,17 @@ def train_teacher(loader, loader_test, device):
                 }, 'regnet_y.pth')
 
 
-def train_mae(loader, loader_test, device):
-    model = MAE()
+def train_mae(loader, loader_test, root):
+    model = MAE(root=root)
 
-    logger = pl.loggers.TensorBoardLogger(save_dir='tb_log', log_graph=True)
+    logger = pl.loggers.TensorBoardLogger(save_dir=os.path.join(root, 'tb_log'), log_graph=False)
     ms = pl.callbacks.ModelSummary(max_depth=7)
-    cpt = pl.callbacks.ModelCheckpoint(dirpath='cpts', save_last=True, every_n_epochs=10)
+    cpt = pl.callbacks.ModelCheckpoint(dirpath=os.path.join(root, 'cpts'), save_last=True, every_n_epochs=10)
     stats = pl.callbacks.DeviceStatsMonitor()
 
     trainer = pl.Trainer(logger=logger, gpus=1, callbacks=[ms, cpt, stats],
                          max_epochs=200, log_every_n_steps=10,
-                         fast_dev_run=False)
+                         fast_dev_run=True)
     trainer.fit(model,
                 train_dataloaders=loader,
                 val_dataloaders=loader_test)
@@ -197,7 +232,8 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
 
         lmbda = 10
 
-        for batch_i, ((X_a, _), (X_b, _)) in tqdm(enumerate(zip(loader_a, loader_b)), total=min(len(loader_a), len(loader_b))):
+        for batch_i, ((X_a, _), (X_b, _)) in tqdm(enumerate(zip(loader_a, loader_b)),
+                                                  total=min(len(loader_a), len(loader_b))):
             X_a = X_a.to(device)
             X_b = X_b.to(device)
 
@@ -212,7 +248,7 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
             x_b_gen, _ = generator_ab(X_a)
             d_score_valid = discriminator_ab(X_b)
             d_score_fake = discriminator_ab(x_b_gen)
-            d_ab_loss = 0.5*(criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
+            d_ab_loss = 0.5 * (criterion_mse(d_score_valid, valid) + criterion_mse(d_score_fake, fake))
             d_ab_loss.backward()
             opt_d_ab.step()
             loss_d_ab_train += d_ab_loss.item()
@@ -226,7 +262,6 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
             opt_d_ba.step()
             loss_d_ba_train += d_ba_loss.item()
 
-
             opt_g_ab.zero_grad()
             opt_g_ba.zero_grad()
 
@@ -239,8 +274,8 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
             x_a_cyc, _ = generator_ba(x_b_gen, mem=x_b_flat)
             x_b_cyc, _ = generator_ab(x_a_gen, mem=x_a_flat)
 
-            g_ab_loss = criterion_mse(d_ab_score_fake, valid) + lmbda*criterion_mae(x_a_cyc, X_a)
-            g_ba_loss = criterion_mse(d_ba_score_fake, valid) + lmbda*criterion_mae(x_b_cyc, X_b)
+            g_ab_loss = criterion_mse(d_ab_score_fake, valid) + lmbda * criterion_mae(x_a_cyc, X_a)
+            g_ba_loss = criterion_mse(d_ba_score_fake, valid) + lmbda * criterion_mae(x_b_cyc, X_b)
             g_loss = g_ab_loss + g_ba_loss
             g_loss.backward()
             opt_g_ba.step()
@@ -281,8 +316,9 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
                 loss_d_ab_train /= len(loader_a)
                 loss_d_ba_train /= len(loader_b)
 
-                print('Epoch: {}, gen a train loss: {}, gen b train loss: {}, disc a train loss {}, disc b train loss: {}'.format(
-                    epoch, loss_g_ab_train, loss_g_ba_train, loss_d_ab_train, loss_d_ba_train))
+                print(
+                    'Epoch: {}, gen a train loss: {}, gen b train loss: {}, disc a train loss {}, disc b train loss: {}'.format(
+                        epoch, loss_g_ab_train, loss_g_ba_train, loss_d_ab_train, loss_d_ba_train))
 
         if epoch % 5000 == 0:
             torch.save({'generator_ab': generator_ab.state_dict(),
@@ -294,13 +330,16 @@ def train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, blocks=6
                         'opt_g_ba': opt_g_ba.state_dict(),
                         'opt_d_ab': opt_d_ab.state_dict(),
                         'opt_d_ba': opt_d_ba.state_dict()
-                        }, os.path.join(out_dir, ('cycle_vitgan_{}_' + mode + ('_siren' if use_siren else '') + '.pth').format(epoch)))
+                        }, os.path.join(out_dir,
+                                        ('cycle_vitgan_{}_' + mode + ('_siren' if use_siren else '') + '.pth').format(
+                                            epoch)))
 
 
 if __name__ == '__main__':
     device = 'cuda:0'
 
     mode = 'mae'
+    root = sys.argv[1]
 
     if mode == 'teacher':
         transform = Compose([Resize(224),
@@ -336,10 +375,9 @@ if __name__ == '__main__':
                                         std=[0.229, 0.224, 0.225])
                               ])
 
-
     batch_size = 32
     n_workers = 4
-    root = '/home/dsenkin/Desktop/scratch/monet2photo'
+    #root = '/home/dsenkin/Desktop/scratch/monet2photo'
 
     if mode == 'vitgan':
         dataset = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform)
@@ -352,15 +390,16 @@ if __name__ == '__main__':
         dataset_b_test = ImageFolder(os.path.join(root, 'test/testB'),
                                      transform=transform_test)
     else:
-        dataset = STL10('stl10', transform=transform, split='train', download=True)
-        dataset_test = STL10('stl10', transform=transform_test, split='test', download=True)
+        dataset = STL10(os.path.join(root, 'stl10'), transform=transform, split='train', download=True)
+        dataset_test = STL10(os.path.join(root, 'stl10'), transform=transform_test, split='test', download=False)
 
     if mode == 'cycle':
-        loader_a = DataLoader(dataset_a, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0),
-                            shuffle=True, pin_memory=True)
+        loader_a = DataLoader(dataset_a, batch_size=batch_size, num_workers=n_workers,
+                              persistent_workers=(n_workers > 0),
+                              shuffle=True, pin_memory=True)
 
         loader_a_test = DataLoader(dataset_a_test, batch_size=batch_size, num_workers=0, persistent_workers=False,
-                                 shuffle=True, pin_memory=True)
+                                   shuffle=True, pin_memory=True)
 
         loader_b = DataLoader(dataset_b, batch_size=batch_size, num_workers=n_workers,
                               persistent_workers=(n_workers > 0),
@@ -369,19 +408,18 @@ if __name__ == '__main__':
         loader_b_test = DataLoader(dataset_b_test, batch_size=batch_size, num_workers=0, persistent_workers=False,
                                    shuffle=True, pin_memory=True)
     else:
-        loader = DataLoader(dataset, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0), shuffle=True, pin_memory=True)
+        loader = DataLoader(dataset, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0),
+                            shuffle=True, pin_memory=True)
 
-        loader_test = DataLoader(dataset_test, batch_size=batch_size, num_workers=n_workers, persistent_workers=False, shuffle=False,
+        loader_test = DataLoader(dataset_test, batch_size=batch_size, num_workers=n_workers, persistent_workers=False,
+                                 shuffle=False,
                                  pin_memory=True)
 
     if mode == 'teacher':
         train_teacher(loader, loader_test, device)
     elif mode == 'mae':
-        train_mae(loader, loader_test, device)
+        train_mae(loader, loader_test, root)
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
     elif mode == 'cycle':
-        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=False)
-
-
-
+        train_gan(loader_a, loader_b, loader_a_test, loader_b_test, device, mode='none', use_siren=True)
