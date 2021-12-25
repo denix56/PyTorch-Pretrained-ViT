@@ -4,7 +4,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms.functional as TF
 from torchvision.datasets import STL10, ImageFolder
 from torchvision.transforms import RandAugment, Compose, Resize, ToTensor, Normalize, RandomResizedCrop
-from torchvision.utils import save_image
+from torchvision.utils import save_image, make_grid
 from torchvision import models
 from tqdm import trange, tqdm
 from torch import nn
@@ -13,20 +13,22 @@ from itertools import chain
 import os
 import sys
 import shutil
+import uuid
 
 from pytorch_pretrained_vit.gan_models import Generator, Discriminator
 
 import pytorch_lightning as pl
 from torchmetrics.image.lpip_similarity import LPIPS
-from torchmetrics import PSNR, MeanSquaredError, MetricCollection
+from torchmetrics import PSNR, MeanSquaredError, MetricCollection, Accuracy, Precision, Recall, AUROC, F1, AveragePrecision
 
 
 class MAE(pl.LightningModule):
-    def __init__(self, lr: float = 1e-4, mask_rate: float = 0.75, root:str = ''):
+    def __init__(self, lr: float = 1e-4, mask_rate: float = 0.75, root: str = '', name: str = ''):
         super().__init__()
         self.lr = lr
         self.mask_rate = mask_rate
         self.root = root
+        self.name = name
 
         self.mask_generator = ViT('mask_generator', distilled=False, num_layers=4, num_heads=6, ff_dim=1536,
                                   image_size=224, mask_gen=True)
@@ -34,7 +36,7 @@ class MAE(pl.LightningModule):
         self.decoder = ViT('decoder', distilled=True, use_mask_token=True, num_layers=4, num_heads=6, ff_dim=1536,
                            image_size=224)
 
-        self.criterion = nn.MSELoss()
+        self.criterion = nn.L1Loss()
 
         self.metrics_train = MetricCollection([
             MeanSquaredError(),
@@ -48,7 +50,7 @@ class MAE(pl.LightningModule):
 
         self.lpips_metric = LPIPS(compute_on_step=False)
 
-        self.save_hyperparameters(ignore='root')
+        self.save_hyperparameters(ignore=['root', 'name'])
 
         self.example_input_array = torch.rand(1, 3, 224, 224)
 
@@ -73,7 +75,12 @@ class MAE(pl.LightningModule):
             out, enc_mask, lengths = self.encoder(x, mask=mask)
             dec_out, _, _ = self.decoder(out, mask=enc_mask, lengths=lengths)
 
-            loss = -self.criterion(dec_out, x) + torch.mean((torch.mean(mask, dim=(1, 2)) - 0.25).abs())
+            mse_loss = -self.criterion(dec_out, x)
+            const_loss = torch.mean((torch.mean(mask_probs, dim=(1, 2)) - 0.25) ** 2)
+            loss = mse_loss + const_loss
+            self.log('mask_loss', loss)
+            self.log('mse_loss', mse_loss)
+            self.log('const_loss', const_loss)
 
         elif optimizer_idx == 1:
             mask_probs, _, _ = self.mask_generator(x)
@@ -92,7 +99,7 @@ class MAE(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-
+        mask_probs = None
         mask_probs, _, _ = self.mask_generator(x)
         mask = torch.bernoulli(mask_probs)
         out, mask, lengths = self.encoder(x, mask=mask)
@@ -114,14 +121,19 @@ class MAE(pl.LightningModule):
         self.lpips_metric(dec_out_norm, x_norm)
 
         if batch_idx == 0:
-            self.logger.experiment.add_images('GT', x, global_step=self.global_step)
-            self.logger.experiment.add_images('Reconstructed', dec_out, global_step=self.global_step)
-            self.logger.experiment.add_images('Mask probs', mask_probs.view(-1, 1, self.mask_generator.gh, self.mask_generator.gw),
-                                              global_step=self.global_step)
+            x = make_grid(x, normalize=True)
+            dec_out = make_grid(dec_out, normalize=True)
 
-            save_image(x, os.path.join(self.root, 'imgs/gt_{}.jpg'.format(self.current_epoch)))
-            save_image(dec_out, os.path.join(self.root, 'imgs/rec_{}.jpg'.format(self.current_epoch)))
-            save_image(mask_probs, os.path.join(self.root, 'imgs/mp_{}.jpg'.format(self.current_epoch)))
+            self.logger.experiment.add_image('GT', x, global_step=self.global_step)
+            self.logger.experiment.add_image('Reconstructed', dec_out, global_step=self.global_step)
+
+            save_image(x, os.path.join(self.root, self.name, 'imgs/gt_{}.jpg'.format(self.current_epoch)))
+            save_image(dec_out, os.path.join(self.root, self.name, 'imgs/rec_{}.jpg'.format(self.current_epoch)))
+
+            if mask_probs is not None:
+                mask_probs = mask_probs.view(-1, 1, self.mask_generator.gh, self.mask_generator.gw)
+                self.logger.experiment.add_images('Mask probs', mask_probs, global_step=self.global_step)
+                save_image(mask_probs, os.path.join(self.root, self.name, 'imgs/mp_{}.jpg'.format(self.current_epoch)))
 
     def on_validation_epoch_end(self):
         metrics_out = self.metrics_val.compute()
@@ -132,6 +144,86 @@ class MAE(pl.LightningModule):
         opt1 = torch.optim.Adam(self.mask_generator.parameters(), lr=self.lr)
         opt2 = torch.optim.Adam(chain(self.encoder.parameters(), self.decoder.parameters()), lr=self.lr)
         return [opt1, opt2]
+
+
+class MAEClassifier(pl.LightningModule):
+    def __init__(self, lr: float = 1e-4, num_classes:int = 10, freeze:bool = False, root: str = '', name: str = '', *args):
+        super().__init__()
+        self.lr = lr
+        self.num_classes = num_classes
+        self.freeze = freeze
+        self.root = root
+        self.name = name
+
+        self.encoder = ViT('encoder', distilled=True, image_size=224, dim=768)
+        self.classifier = nn.Linear(768, num_classes)
+
+        self.criterion = nn.CrossEntropyLoss()
+
+        self.metrics_train = MetricCollection([
+            Accuracy(num_classes=num_classes),
+            Precision(num_classes=num_classes),
+            Recall(num_classes=num_classes),
+            AUROC(num_classes=num_classes),
+            F1(num_classes=num_classes),
+            AveragePrecision(num_classes=num_classes)
+        ], prefix='train/')
+
+        self.metrics_val = MetricCollection([
+            Accuracy(num_classes=num_classes, compute_on_step=False, average='macro'),
+            Precision(num_classes=num_classes, compute_on_step=False, average='macro'),
+            Recall(num_classes=num_classes, compute_on_step=False, average='macro'),
+            AUROC(num_classes=num_classes, compute_on_step=False, average='macro'),
+            F1(num_classes=num_classes, compute_on_step=False, average='macro'),
+            AveragePrecision(num_classes=num_classes, compute_on_step=False, average='macro')
+        ], prefix='val/')
+
+        self.save_hyperparameters('lr', 'num_classes', 'freeze')
+
+        self.example_input_array = torch.rand(1, 3, 224, 224)
+
+    def forward(self, x):
+        out, _, _ = self.encoder(x)
+        probs = F.softmax(self.classifier(out[:, 0]), dim=-1)
+
+        return probs
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        out, _, _ = self.encoder(x)
+        out = self.classifier(out[:, 0])
+
+        loss = self.criterion(out, y)
+        metrics_train = self.metrics_train(F.softmax(out, dim=-1), y)
+        self.log('loss', loss)
+        self.log_dict(metrics_train)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        probs = self(x)
+
+        self.metrics_val(probs, y)
+
+    def on_validation_epoch_end(self):
+        metrics_out = self.metrics_val.compute()
+        self.log_dict(metrics_out)
+
+    def configure_optimizers(self):
+        opt1 = torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
+        return opt1
+
+
+class MAEFinetuning(pl.callbacks.BaseFinetuning):
+    def freeze_before_training(self, pl_module):
+        self.freeze(pl_module.encoder)
+        self.make_trainable([pl_module.encoder.transformer.blocks[-1], pl_module.encoder.norm])
+
+    def finetune_function(self, pl_module, current_epoch, optimizer, optimizer_idx):
+        pass
+
 
 
 def train_teacher(loader, loader_test, device):
@@ -182,17 +274,34 @@ def train_teacher(loader, loader_test, device):
                 }, 'regnet_y.pth')
 
 
-def train_mae(loader, loader_test, root):
-    model = MAE(root=root)
+def train_mae(loader, loader_test, root, classify = False, pretrained_path:str = None):
+    name = str(uuid.uuid4()) + '_0.25_l1'
 
-    logger = pl.loggers.TensorBoardLogger(save_dir=os.path.join(root, 'tb_log'), log_graph=False)
-    ms = pl.callbacks.ModelSummary(max_depth=7)
-    cpt = pl.callbacks.ModelCheckpoint(dirpath=os.path.join(root, 'cpts'), save_last=True, every_n_epochs=10)
-    stats = pl.callbacks.DeviceStatsMonitor()
+    callbacks = []
 
-    trainer = pl.Trainer(logger=logger, gpus=1, callbacks=[ms, cpt, stats],
-                         max_epochs=200, log_every_n_steps=10,
-                         fast_dev_run=True)
+    if classify:
+        name += '_classifier'
+
+        if pretrained_path is not None:
+            model = MAEClassifier.load_from_checkpoint(pretrained_path, strict=False, root=root, name=name, freeze=True)
+            callbacks.append(MAEFinetuning())
+        else:
+            model = MAEClassifier(root=root, name=name)
+    else:
+        model = MAE(root=root, name=name)
+
+    os.makedirs(os.path.join(root, name, 'imgs'), exist_ok=True)
+    os.makedirs(os.path.join(root, name, 'cpts'), exist_ok=True)
+
+    print('Name: {}'.format(name))
+
+    logger = pl.loggers.TensorBoardLogger(save_dir=os.path.join(root, 'tb_log'), log_graph=False, version=name)
+    callbacks.append(pl.callbacks.ModelSummary(max_depth=7))
+    callbacks.append(pl.callbacks.ModelCheckpoint(dirpath=os.path.join(root, name, 'cpts'), save_last=True, every_n_epochs=10))
+
+    trainer = pl.Trainer(logger=logger, gpus=1, callbacks=callbacks,
+                         max_epochs=1000, log_every_n_steps=10,
+                         fast_dev_run=False)
     trainer.fit(model,
                 train_dataloaders=loader,
                 val_dataloaders=loader_test)
@@ -341,6 +450,11 @@ if __name__ == '__main__':
     mode = 'mae'
     root = sys.argv[1]
 
+    if mode == 'mae' and len(sys.argv) > 2:
+        classify = sys.argv[2]
+        if classify and len(sys.argv) == 4:
+            pretrained_path = sys.argv[3]
+
     if mode == 'teacher':
         transform = Compose([Resize(224),
                              RandAugment(),
@@ -375,9 +489,9 @@ if __name__ == '__main__':
                                         std=[0.229, 0.224, 0.225])
                               ])
 
-    batch_size = 32
+    batch_size = 64
     n_workers = 4
-    #root = '/home/dsenkin/Desktop/scratch/monet2photo'
+    # root = '/home/dsenkin/Desktop/scratch/monet2photo'
 
     if mode == 'vitgan':
         dataset = ImageFolder('C:/Users/denys/PyTorch-Pretrained-ViT/afhq/train', transform=transform)
@@ -390,7 +504,8 @@ if __name__ == '__main__':
         dataset_b_test = ImageFolder(os.path.join(root, 'test/testB'),
                                      transform=transform_test)
     else:
-        dataset = STL10(os.path.join(root, 'stl10'), transform=transform, split='train', download=True)
+        print('Loading dataset...')
+        dataset = STL10(os.path.join(root, 'stl10'), transform=transform, split='train', download=False)
         dataset_test = STL10(os.path.join(root, 'stl10'), transform=transform_test, split='test', download=False)
 
     if mode == 'cycle':
@@ -408,6 +523,7 @@ if __name__ == '__main__':
         loader_b_test = DataLoader(dataset_b_test, batch_size=batch_size, num_workers=0, persistent_workers=False,
                                    shuffle=True, pin_memory=True)
     else:
+        print('Creating loaders...')
         loader = DataLoader(dataset, batch_size=batch_size, num_workers=n_workers, persistent_workers=(n_workers > 0),
                             shuffle=True, pin_memory=True)
 
@@ -418,7 +534,8 @@ if __name__ == '__main__':
     if mode == 'teacher':
         train_teacher(loader, loader_test, device)
     elif mode == 'mae':
-        train_mae(loader, loader_test, root)
+        print('Starting training...')
+        train_mae(loader, loader_test, root, classify=classify, pretrained_path=pretrained_path)
     elif mode == 'vitgan':
         train_gan(loader, loader_test, device)
     elif mode == 'cycle':

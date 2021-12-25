@@ -221,19 +221,12 @@ class ViT(nn.Module):
                 if mask_rate > 0.0:
                     mask_indices = torch.multinomial(torch.full((1, x.shape[1]), 1/x.shape[1], device=x.device).expand(b, -1),
                                                      int((1-mask_rate)*x.shape[1]))
-                    mask = torch.zeros(*x.shape[:2], dtype=bool, device=x.device)
+                    mask = torch.zeros(*x.shape[:2], dtype=torch.float32, device=x.device)
                     mask.scatter_(1, mask_indices, 1)
-                    x = x[mask].view(b, -1, x.shape[2])
+                    mask = mask.unsqueeze(-1)
+                    #x = x[mask].view(b, -1, x.shape[2])
                 elif mask is not None:
                     x = x*mask
-                    #mask_b = mask.squeeze(-1) > 0
-                    #x = [x[i, mask_b[i]] for i in range(x.shape[0])]
-                    #max_len = max(x, key=lambda x: x.shape[0])
-
-                    #print(x.shape)
-                    #x = x.view(b, -1, x.shape[-1])
-                else:
-                    raise NotImplementedError()
 
                 add_patches = 0
                 if hasattr(self, 'class_token'):
@@ -282,14 +275,15 @@ class ViT(nn.Module):
             x = self.unconv(x)
             x = torch.sigmoid(x)
 
-        if mask is None:
-            if hasattr(self, 'pre_logits'):
-                x = self.pre_logits(x)
-                x = torch.tanh(x)
-            if hasattr(self, 'fc'):
-                x = self.norm(x)[:, 0]  # b,d
-                x = self.fc(x)  # b,num_classes
-        elif not self.use_mask_token:
+        # if mask is None:
+        #     pass
+        #     # if hasattr(self, 'pre_logits'):
+        #     #     x = self.pre_logits(x)
+        #     #     x = torch.tanh(x)
+        #     # if hasattr(self, 'fc'):
+        #     #     x = self.norm(x)[:, 0]  # b,d
+        #     #     x = self.fc(x)  # b,num_classes
+        if not self.use_mask_token:
             x = self.norm(x)
         return x, mask, lengths
 
